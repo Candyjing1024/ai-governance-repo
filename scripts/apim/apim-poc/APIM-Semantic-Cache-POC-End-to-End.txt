@@ -1,0 +1,547 @@
+================================================================================
+  APIM + Redis Semantic Caching - End-to-End POC
+  Date: April 2026
+================================================================================
+
+WHY THIS POC EXISTS
+-------------------
+A team was trying to enable Azure OpenAI semantic caching on their APIM
+instance.  The portal wizard surfaced three errors and they got stuck.
+We built this POC from scratch in a separate subscription to:
+
+  1. Reproduce every error the team encountered
+  2. Find the root cause for each one
+  3. Prove that semantic caching actually works end-to-end
+  4. Document exactly what needs to change
+
+This is the full story of how we got it working, including every wrong turn
+and lesson learned along the way.
+
+
+================================================================================
+PART 1: WHAT WE BUILT
+================================================================================
+
+We created a minimal environment that mirrors the production setup:
+
+  Resource Group:     {rg-poc} (East US)
+  APIM:               {apim-poc} (Consumption tier, System MI)
+  Azure AI Services:  {ai-services-poc} (AIServices kind)
+    - gpt-4.1 deployment (GlobalStandard, model version 2025-04-14)
+    - text-embedding-3-small deployment (Standard, v1)
+  Redis:              {redis-poc} (Balanced B0, 0.5 GB)
+    - Modules: RediSearch + RedisJSON
+    - Clustering: EnterpriseCluster
+    - Public access: Enabled
+    - Access keys auth: Enabled
+
+
+================================================================================
+PART 2: CREATING THE REDIS INSTANCE
+================================================================================
+
+This was done through the Azure Portal:
+
+  1. Search "Azure Managed Redis" > Create
+  2. Settings:
+     - Name: {redis-poc}
+     - Region: East US
+     - SKU: Balanced B0 (smallest, cheapest - fine for POC)
+     - Modules: Check BOTH "RediSearch" and "RedisJSON"
+       (RediSearch is REQUIRED for semantic caching - vector search)
+       (You can ONLY enable modules at creation time, not after)
+     - Clustering Policy: EnterpriseCluster (required for the modules)
+  3. Networking tab:
+     - Public network access: ENABLED
+     - (The production environment had this DISABLED with 0 private
+        endpoints - this was blocker #1)
+  4. Create and wait ~10 minutes for provisioning
+
+Verify it was created:
+
+  # -----------------------------------------------------------------------
+  # Script: Verify Redis Instance
+  # -----------------------------------------------------------------------
+  az resource show `
+    --name {redis-poc} `
+    --resource-type "Microsoft.Cache/redisEnterprise" `
+    --query "{name:name, host:properties.hostName, port:properties.redisPort, state:properties.provisioningState}" `
+    -o json
+
+  # Check modules and access keys:
+  az rest --method GET `
+    --url "https://management.azure.com/subscriptions/{sub-id}/resourceGroups/{rg-poc}/providers/Microsoft.Cache/redisEnterprise/{redis-poc}/databases/default?api-version=2024-09-01-preview" `
+    --query "{modules:properties.modules[].name, accessKeys:properties.accessKeysAuthentication}" `
+    -o json
+  # Expected: modules=["RediSearch","RedisJSON"], accessKeys="Enabled"
+  # -----------------------------------------------------------------------
+
+
+================================================================================
+PART 3: RBAC ASSIGNMENTS
+================================================================================
+
+This is where the third portal error came from. The wizard needs the user to
+have permissions to call listKeys on Redis AND update the APIM cache entity.
+Here is what we assigned:
+
+  # -----------------------------------------------------------------------
+  # Script: RBAC Setup
+  # -----------------------------------------------------------------------
+
+  # Variables (replace with your values)
+  $subId = "{sub-id}"
+  $rg = "{rg-poc}"
+  $apimMI = "{apim-mi-principal-id}"     # APIM system MI principal ID
+  $userId = "{user-object-id}"           # Signed-in user object ID
+  $foundryScope = "/subscriptions/$subId/resourceGroups/$rg/providers/Microsoft.CognitiveServices/accounts/{ai-services-poc}"
+  $redisScope = "/subscriptions/$subId/resourceGroups/$rg/providers/Microsoft.Cache/redisEnterprise/{redis-poc}"
+
+  # 1. APIM MI -> Cognitive Services OpenAI User (on AI Services resource)
+  #    So APIM can call chat completions AND embeddings via managed identity
+  az role assignment create `
+    --assignee-object-id $apimMI `
+    --assignee-principal-type ServicePrincipal `
+    --role "Cognitive Services OpenAI User" `
+    --scope $foundryScope
+
+  # 2. APIM MI -> Contributor (on Redis resource)
+  #    "Redis Cache Contributor" is NOT enough for Enterprise tier.
+  #    Contributor is needed for the listKeys/listSecrets actions.
+  az role assignment create `
+    --assignee-object-id $apimMI `
+    --assignee-principal-type ServicePrincipal `
+    --role "Contributor" `
+    --scope $redisScope
+
+  # 3. User -> Contributor (on Redis resource)
+  #    So the portal wizard can call listKeys when linking the cache.
+  az role assignment create `
+    --assignee-object-id $userId `
+    --assignee-principal-type User `
+    --role "Contributor" `
+    --scope $redisScope
+  # -----------------------------------------------------------------------
+
+LESSON LEARNED: We first tried "Redis Cache Contributor" which looked like
+the right role. It was not. The listKeys action on Azure Managed Redis
+Enterprise requires full "Contributor" at the resource scope. This is
+different from classic Azure Cache for Redis.
+
+
+================================================================================
+PART 4: LINKING REDIS AS APIM EXTERNAL CACHE
+================================================================================
+
+We tried the portal wizard first. Even with correct RBAC, it threw the
+"listSecrets" error. So we bypassed it entirely with the REST API.
+
+  # -----------------------------------------------------------------------
+  # Script: Get Redis Keys
+  # -----------------------------------------------------------------------
+  az rest --method POST `
+    --url "https://management.azure.com/subscriptions/{sub-id}/resourceGroups/{rg-poc}/providers/Microsoft.Cache/redisEnterprise/{redis-poc}/databases/default/listKeys?api-version=2024-09-01-preview" `
+    -o json
+  # Returns: { "primaryKey": "...", "secondaryKey": "..." }
+  # -----------------------------------------------------------------------
+
+  # -----------------------------------------------------------------------
+  # Script: Create APIM External Cache Entity
+  # -----------------------------------------------------------------------
+  # Build the connection string: host:port,password=key,ssl=True,abortConnect=False
+  $cacheJson = @'
+  {
+    "properties": {
+      "connectionString": "{redis-host}:10000,password={redis-primary-key},ssl=True,abortConnect=False",
+      "useFromLocation": "default",
+      "description": "Redis Enterprise semantic cache"
+    }
+  }
+  '@
+  [IO.File]::WriteAllText("$env:TEMP\apim-cache.json", $cacheJson, [Text.UTF8Encoding]::new($false))
+
+  az rest --method PUT `
+    --url "https://management.azure.com/subscriptions/{sub-id}/resourceGroups/{rg-poc}/providers/Microsoft.ApiManagement/service/{apim-poc}/caches/default?api-version=2023-09-01-preview" `
+    --body "@$env:TEMP\apim-cache.json" `
+    --headers "Content-Type=application/json"
+  # -----------------------------------------------------------------------
+
+IMPORTANT NOTE ON FILE ENCODING: PowerShell's Out-File and Set-Content add
+a UTF-8 BOM by default. The az rest command chokes on it. Always use
+[IO.File]::WriteAllText() with UTF8Encoding($false) to write JSON files
+that az rest will consume. This bit us multiple times.
+
+
+================================================================================
+PART 5: CREATING THE EMBEDDINGS BACKEND
+================================================================================
+
+The semantic cache policy needs a backend that points to an embeddings model.
+This backend is how APIM converts prompts into vectors for similarity search.
+
+CRITICAL LESSON: The backend URL must be the FULL deployment path, not just
+the base OpenAI endpoint. We initially set it to:
+  https://{ai-services-poc}.openai.azure.com/openai       <-- WRONG
+
+This caused 404 errors on every chat completion request because the semantic
+cache lookup could not reach the embeddings API. The correct URL is:
+  https://{ai-services-poc}.openai.azure.com/openai/deployments/text-embedding-3-small/embeddings
+
+  # -----------------------------------------------------------------------
+  # Script: Create Embeddings Backend
+  # -----------------------------------------------------------------------
+  $backendJson = '{"properties":{"url":"https://{ai-services-poc}.openai.azure.com/openai/deployments/text-embedding-3-small/embeddings","protocol":"http","description":"Embeddings backend for semantic cache"}}'
+  [IO.File]::WriteAllText("$env:TEMP\backend.json", $backendJson, [Text.UTF8Encoding]::new($false))
+
+  az rest --method PUT `
+    --url "https://management.azure.com/subscriptions/{sub-id}/resourceGroups/{rg-poc}/providers/Microsoft.ApiManagement/service/{apim-poc}/backends/embeddings-backend?api-version=2023-09-01-preview" `
+    --body "@$env:TEMP\backend.json" `
+    --headers "Content-Type=application/json"
+  # -----------------------------------------------------------------------
+
+
+================================================================================
+PART 6: APPLYING THE SEMANTIC CACHE POLICY
+================================================================================
+
+The policy goes on the chat-completions operation of the Azure AI Gateway API.
+Our APIM already had an API called "azure-ai-gateway" at path /openai with
+20 operations including "chat-completions".
+
+The API-level policy already handled MI auth to the backend:
+
+  <policies>
+    <inbound>
+      <base />
+      <set-header name="api-key" exists-action="delete" />
+      <authentication-managed-identity resource="https://cognitiveservices.azure.com" />
+    </inbound>
+    ...
+  </policies>
+
+We added the semantic cache policy at the OPERATION level (chat-completions):
+
+  # -----------------------------------------------------------------------
+  # Script: Apply Semantic Cache Policy
+  # -----------------------------------------------------------------------
+  $policyXml = '<policies><inbound><base /><azure-openai-semantic-cache-lookup score-threshold="0.15" embeddings-backend-id="embeddings-backend" embeddings-backend-auth="system-assigned" /></inbound><backend><base /></backend><outbound><base /><azure-openai-semantic-cache-store duration="60" /></outbound><on-error><base /></on-error></policies>'
+
+  $body = @{properties=@{value=$policyXml;format="xml"}} | ConvertTo-Json -Depth 3
+  [IO.File]::WriteAllText("$env:TEMP\policy.json", $body, [Text.UTF8Encoding]::new($false))
+
+  az rest --method PUT `
+    --url "https://management.azure.com/subscriptions/{sub-id}/resourceGroups/{rg-poc}/providers/Microsoft.ApiManagement/service/{apim-poc}/apis/{api-id}/operations/{operation-id}/policies/policy?api-version=2023-09-01-preview" `
+    --body "@$env:TEMP\policy.json" `
+    --headers "Content-Type=application/json"
+  # -----------------------------------------------------------------------
+
+KEY POLICY ATTRIBUTES:
+  - score-threshold="0.15": Max vector distance for a cache hit. NOT a
+    similarity percentage. Lower = stricter. See Section 9 for tuning.
+  - embeddings-backend-id="embeddings-backend": References the backend
+    we created in Part 5.
+  - embeddings-backend-auth="system-assigned": APIM uses its system MI
+    to authenticate to the embeddings endpoint.
+  - duration="60": Cache entries expire after 60 seconds. Increase for
+    production (e.g., 3600 for 1 hour).
+
+
+================================================================================
+PART 7: THE 404 DEBUGGING SAGA
+================================================================================
+
+After applying the policy, our test calls returned 404:
+
+  POST https://{apim-poc}.azure-api.net/openai/deployments/gpt-4.1/chat/completions?api-version=2025-04-14
+  -> 404 Not Found
+
+We spent considerable time debugging. Here is what we checked and ruled out:
+
+  CHECK 1: Is the API configured correctly?
+    Path: openai, ServiceUrl: https://{ai-services-poc}.openai.azure.com/openai
+    Protocols: [https], subscriptionRequired: false
+    -> All correct.
+
+  CHECK 2: Is it the semantic cache policy breaking things?
+    Removed the policy entirely, same prompt -> still 404.
+    BUT: Embeddings endpoint worked fine (200).
+    -> Not the policy; something about the chat completions path itself.
+
+  CHECK 3: Does the backend accept the request directly?
+    Called the AI Services endpoint directly with api-key auth:
+      api-version=2025-04-14  -> 404
+      api-version=2024-10-21  -> 200!
+      api-version=2024-06-01  -> 200!
+    -> The model version "2025-04-14" is NOT a valid Azure OpenAI API version.
+       It is the MODEL version, not the API version. They look similar and
+       it is an easy mistake.
+
+  SOLUTION: Use api-version=2024-10-21 (or 2024-12-01-preview, 2024-06-01).
+
+  # -----------------------------------------------------------------------
+  # Script: Verify Correct API Version
+  # -----------------------------------------------------------------------
+  # These work:
+  $workingVersions = @("2024-10-21", "2024-12-01-preview", "2024-06-01", "2025-03-01-preview")
+  # This does NOT work (it's a model version, not an API version):
+  $broken = "2025-04-14"
+  # -----------------------------------------------------------------------
+
+The other issue was the embeddings backend URL. When set to just the base
+/openai path, the semantic cache lookup policy would try to call the gpt-4.1
+deployment for embeddings (since it follows the same path structure). This
+returned errors silently, and the policy fell through to a cache MISS every
+time. Fixing the backend URL to the full /deployments/text-embedding-3-small/embeddings
+path resolved this. (See Part 5.)
+
+
+================================================================================
+PART 8: TEST RESULTS
+================================================================================
+
+Once everything was configured correctly, we ran tests with APIM tracing
+enabled to get detailed cache behavior logs.
+
+  # -----------------------------------------------------------------------
+  # Script: Test Semantic Caching
+  # -----------------------------------------------------------------------
+
+  $uri = "https://{apim-poc}.azure-api.net/openai/deployments/gpt-4.1/chat/completions?api-version=2024-10-21"
+  $headers = @{
+    "Content-Type" = "application/json"
+    "Ocp-Apim-Subscription-Key" = "{apim-subscription-key}"
+    "Ocp-Apim-Trace" = "true"
+  }
+
+  # ----- TEST 1: First call - expect cache MISS --------------------------
+  $sw = [Diagnostics.Stopwatch]::StartNew()
+  $r = Invoke-WebRequest $uri -Method POST -Headers $headers -Body '{"messages":[{"role":"user","content":"Name three benefits of renewable energy sources."}],"max_tokens":60,"stream":false}' -UseBasicParsing
+  $sw.Stop()
+  "Test 1 - First call: $($sw.ElapsedMilliseconds)ms"
+  # Result: 2060ms - MISS (backend hit, response stored in cache)
+
+  # ----- TEST 2: Same exact prompt - expect cache HIT --------------------
+  $sw = [Diagnostics.Stopwatch]::StartNew()
+  $r = Invoke-WebRequest $uri -Method POST -Headers $headers -Body '{"messages":[{"role":"user","content":"Name three benefits of renewable energy sources."}],"max_tokens":60,"stream":false}' -UseBasicParsing
+  $sw.Stop()
+  "Test 2 - Same prompt: $($sw.ElapsedMilliseconds)ms"
+  # Result: 692ms - HIT! (3x faster, identical response text)
+
+  # ----- TEST 3: Completely different topic - expect MISS ----------------
+  $sw = [Diagnostics.Stopwatch]::StartNew()
+  $r = Invoke-WebRequest $uri -Method POST -Headers $headers -Body '{"messages":[{"role":"user","content":"How do you change a car tire?"}],"max_tokens":60,"stream":false}' -UseBasicParsing
+  $sw.Stop()
+  "Test 3 - Different topic: $($sw.ElapsedMilliseconds)ms"
+  # Result: 1870ms - MISS (correct, different topic not cached)
+  # -----------------------------------------------------------------------
+
+
+TRACE PROOF:
+
+We fetched the APIM trace for the cache HIT call. Key messages:
+
+  source: "azure-openai-semantic-cache-lookup"
+  data:   "Using cache 'default'."
+
+  source: "azure-openai-semantic-cache-lookup"
+  message: "Found cache entry using semantic search within threshold of
+            '0.05', and similarity score '1' under the vary-by partition
+            'None'. Vector distance is '0'."
+
+  source: "azure-openai-semantic-cache-lookup"
+  message: "Cache lookup resulted in a hit! Cached response will be used.
+            Processing will continue from the step in the response pipeline
+            that is after the corresponding `cache-store`."
+
+For the semantic similarity test ("What is the colour of the sky?" matching
+a cached "What color is the sky?"):
+
+  source: "azure-openai-semantic-cache-lookup"
+  message: "Found cache entry using semantic search within threshold of
+            '0.8', and similarity score '0.9708085' under the vary-by
+            partition 'None'. Vector distance is '0.02919149'."
+  message: "Cache lookup resulted in a hit!"
+
+This proves the semantic matching works: "colour" matched "color" with a
+similarity score of 0.971 (vector distance 0.029).
+
+
+SUMMARY TABLE:
+
+  Test                    | Latency  | Cache  | Notes
+  ------------------------|----------|--------|---------------------------
+  First call (new prompt) | 2060ms   | MISS   | Backend hit, stored
+  Same exact prompt       |  692ms   | HIT    | 3x faster
+  Paraphrase (colour/color)| 585ms   | HIT    | Score 0.971
+  Different topic         | 1870ms   | MISS   | Correct rejection
+
+
+================================================================================
+PART 9: SCORE-THRESHOLD TUNING (LESSONS LEARNED)
+================================================================================
+
+We tested three threshold values. The results were surprising:
+
+THRESHOLD 0.80 (TOO LOOSE):
+  Everything was a cache HIT - even completely unrelated prompts.
+  "How do submarines navigate underwater?" returned a cached response about
+  car engines. The vector distance was 0.68, which is under the 0.80 threshold.
+  This is DANGEROUSLY wrong. Never use 0.80 in production.
+
+THRESHOLD 0.05 (TOO STRICT):
+  Exact matches hit (distance 0), but reasonable paraphrases missed.
+  "When was the Great Wall mainly constructed?" did NOT match a cached
+  "In what century was the Great Wall primarily built?" because the
+  distance exceeded 0.05.
+
+THRESHOLD 0.15 (RECOMMENDED):
+  Good balance. Catches meaningful paraphrases like "colour" vs "color"
+  (distance 0.029) while rejecting unrelated topics (distance 0.68).
+
+  Microsoft docs say:
+    "Score threshold above 0.2 may lead to cache mismatch."
+    "Start with a low value such as 0.05 and adjust."
+
+Our recommendation: Start at 0.15 and tune based on your specific prompts.
+
+
+================================================================================
+PART 10: FULL ARCHITECTURE DIAGRAM
+================================================================================
+
+  User/App
+    |
+    | POST /openai/deployments/gpt-4.1/chat/completions
+    v
+  [Azure API Management]  (Consumption tier, System MI)
+    |
+    |-- Inbound Policy:
+    |   1. <base /> (inherits API-level MI auth policy)
+    |   2. <azure-openai-semantic-cache-lookup>
+    |      |
+    |      |-- Calls embeddings-backend to vectorize the prompt
+    |      |   (https://{ai-services-poc}.../deployments/text-embedding-3-small/embeddings)
+    |      |   Auth: system-assigned MI -> cognitiveservices.azure.com
+    |      |
+    |      |-- Queries Redis (RediSearch) for nearest vector
+    |      |   Connection: {redis-host}:10000 (SSL, access key)
+    |      |
+    |      |-- IF distance < threshold: CACHE HIT -> return cached response
+    |      |-- IF distance >= threshold: CACHE MISS -> continue to backend
+    |
+    |-- Backend: https://{ai-services-poc}.openai.azure.com/openai
+    |   Auth: system-assigned MI -> cognitiveservices.azure.com
+    |
+    |-- Outbound Policy:
+    |   1. <azure-openai-semantic-cache-store duration="60">
+    |      Stores the response + its embedding vector in Redis
+    |   2. <base />
+    |
+    v
+  Response to User/App
+
+
+================================================================================
+PART 11: MAPPING TO THE PRODUCTION ENVIRONMENT
+================================================================================
+
+What we proved in our POC maps directly to the production setup:
+
+  Our POC                           Production
+  --------------------------------  --------------------------------
+  {apim-poc}                        {apim-prod}
+  {redis-poc}                       {redis-prod}
+  {ai-services-poc}                 {ai-services-prod}
+  {rg-poc}                          {rg-prod}
+
+  WHAT WE FIXED:                    WHAT PRODUCTION NEEDS TO FIX:
+  --------------------------------  --------------------------------
+  Public access: Enabled            Change from Disabled to Enabled
+                                    (or add Private Endpoint)
+  Access keys: Enabled              Verify Enabled
+  Contributor on Redis (user)       Assign to the portal user
+  Contributor on Redis (APIM MI)    Assign to the APIM MI
+  Cog Svcs OpenAI User (APIM MI)   Assign to the APIM MI
+  Embeddings model deployed         Verify text-embedding-3-small exists
+  Backend URL: full deployment path Ensure wizard sets this correctly
+  score-threshold: 0.15             Recommend 0.15, NOT 0.80
+  api-version: 2024-10-21           Use a valid API version, not model ver
+
+
+================================================================================
+PART 12: THINGS THAT BIT US (GOTCHAS)
+================================================================================
+
+1. UTF-8 BOM: PowerShell adds a BOM to files by default. az rest rejects it.
+   Always use [IO.File]::WriteAllText() with UTF8Encoding($false).
+
+2. "Redis Cache Contributor" vs "Contributor": Enterprise Redis needs full
+   Contributor for listKeys. The specialty role isn't enough.
+
+3. Embeddings backend URL: Must include /deployments/{name}/embeddings.
+   Just /openai alone causes silent failures in the semantic cache lookup.
+
+4. API version vs model version: "2025-04-14" is gpt-4.1's model version,
+   not a valid Azure OpenAI API version. Returns 404 from the backend.
+
+5. Cache store is async: After the first call, the response is "buffered
+   during streaming and stored after received in full." The SECOND call
+   may still miss. The third call reliably hits.
+
+6. score-threshold is max DISTANCE, not min similarity: 0.80 means any
+   vector within distance 0.80 will match. Most topics are within 0.80
+   of each other. Use 0.05-0.15.
+
+7. Portal wizard brittleness: Even with all prerequisites met, the APIM
+   portal "Apply semantic caching" wizard can fail. The CLI/REST API
+   approach (Parts 4-6) is a reliable bypass.
+
+8. Consumption tier cold starts: Test calls may take 2-3 seconds on first
+   hit due to Consumption tier spinning up. Subsequent calls (including
+   cache hits) are faster.
+
+
+================================================================================
+PART 13: CLEANUP
+================================================================================
+
+The Redis instance is being kept for now as reference. To clean up later:
+
+  # Remove the APIM external cache link:
+  az rest --method DELETE `
+    --url "https://management.azure.com/subscriptions/{sub-id}/resourceGroups/{rg-poc}/providers/Microsoft.ApiManagement/service/{apim-poc}/caches/default?api-version=2023-09-01-preview"
+
+  # Remove the embeddings backend:
+  az rest --method DELETE `
+    --url "https://management.azure.com/subscriptions/{sub-id}/resourceGroups/{rg-poc}/providers/Microsoft.ApiManagement/service/{apim-poc}/backends/embeddings-backend?api-version=2023-09-01-preview"
+
+  # Reset the chat-completions policy to base-only:
+  # (use the portal or the REST API approach from Part 6 with a base-only XML)
+
+  # Delete the Redis instance (when ready):
+  # az resource delete --name {redis-poc} --resource-type "Microsoft.Cache/redisEnterprise" -g {rg-poc}
+
+
+================================================================================
+REFERENCES
+================================================================================
+
+  - Enable semantic caching:
+    https://learn.microsoft.com/en-us/azure/api-management/azure-openai-enable-semantic-caching
+
+  - azure-openai-semantic-cache-lookup policy:
+    https://learn.microsoft.com/en-us/azure/api-management/azure-openai-semantic-cache-lookup-policy
+
+  - azure-openai-semantic-cache-store policy:
+    https://learn.microsoft.com/en-us/azure/api-management/azure-openai-semantic-cache-store-policy
+
+  - Use an external cache in APIM:
+    https://learn.microsoft.com/en-us/azure/api-management/api-management-howto-cache-external
+
+  - Azure Managed Redis quickstart:
+    https://learn.microsoft.com/en-us/azure/redis/quickstart-create-managed-redis
+
+
+================================================================================
+END OF DOCUMENT
+================================================================================

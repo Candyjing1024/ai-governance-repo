@@ -1,0 +1,191 @@
+AI Gateway Scripts — Usage Guide
+=================================
+
+These scripts link your existing APIM instance to your existing
+Foundry resource, creating an AI Gateway.  APIM will front all
+model calls and authenticate to Foundry using its Managed Identity.
+No API keys are stored or passed at any point.
+
+
+What you need before running anything
+--------------------------------------
+
+These resources must already exist (they do in our setup):
+
+  APIM instance:      apim-chubb-mcp-poc  (Consumption tier)
+  Foundry resource:   foundry-test-0020   (gpt-4.1 deployed)
+  Service Principal:  sp-chubb-apim-poc
+    Client ID:        de39560f-3f3c-4849-a11a-4e734eb5d50b
+    Client Secret:    in 00-Config.ps1
+  Resource Group:     rg-chubb-mcp-poc
+  Subscription:       a3223db3-76f2-4a7c-8684-57b835dc77e7
+
+The SP needs Contributor on the resource group so it can modify APIM
+and assign RBAC roles.  No "az login" is needed — every script uses
+the SP credentials directly.
+
+
+How authentication works
+------------------------
+
+Two separate layers:
+
+  Setup time (when you run the scripts):
+    Scripts authenticate to ARM using the Service Principal's
+    client_id + client_secret.  This is the same SP from 00-Config.ps1
+    that was created in Step 01.
+
+  Runtime (every API call through the gateway):
+    When a request comes in, the APIM policy:
+      1. Strips any "api-key" header the caller sends
+      2. Fetches a short-lived token from APIM's Managed Identity
+      3. Passes that token to Foundry
+
+    Result: no API keys stored anywhere.  The MI token auto-rotates.
+    Even if someone intercepts a gateway call, they get a response —
+    not a reusable credential.
+
+
+The scripts
+-----------
+
+  00-Config.ps1
+    Shared config.  All other scripts dot-source this file.
+    Contains tenant, subscription, resource names, SP credentials,
+    and helper functions like Get-SpToken.
+
+    You don't run this directly — the other scripts pull it in.
+
+
+  06-Create-AIGateway-SDK.ps1
+
+    Uses Az PowerShell modules (Az.ApiManagement).  Logs in via
+    Connect-AzAccount with SP credentials.
+
+    Steps it runs:
+      1. Connect-AzAccount with the SP
+      2. Check/enable system-assigned managed identity on APIM
+      3. Assign "Cognitive Services OpenAI User" role to the MI
+      4. Create an API at path /openai pointing to Foundry
+      5. Add operations: chat completions, completions, embeddings,
+         list models
+      6. Apply the MI auth policy
+
+    When to pick this one:
+      You have Az modules installed, or don't mind installing them.
+      Better error messages, automatic retries.
+
+    To run:
+      cd apim-poc
+      .\06-Create-AIGateway-SDK.ps1
+
+
+  06b-Create-AIGateway-REST.ps1
+
+    Same result as 06, but uses raw ARM REST calls.  No Az modules
+    needed.  Gets an ARM token from the SP via a simple POST to
+    login.microsoftonline.com, then calls the ARM API directly.
+
+    When to pick this one:
+      You want to avoid installing modules, or you want to see the
+      exact HTTP calls being made.
+
+    To run:
+      cd apim-poc
+      .\06b-Create-AIGateway-REST.ps1
+
+
+  07-Test-AIGateway.ps1
+
+    Runs 5 automated tests, then prints curl commands for manual
+    testing.
+
+    Test 1 — Chat completion, no caller auth.  MI handles backend.
+    Test 2 — Chat completion with APIM subscription key (fetched
+             via ARM using the SP).
+    Test 3 — List deployed models through the gateway.
+    Test 4 — Chat with the SP's JWT token.  The MI policy strips
+             the caller token and substitutes its own.
+    Test 5 — Call a model that doesn't exist (should 404).
+
+    After the tests, it prints curl commands you can copy into
+    any terminal.
+
+    To run:
+      cd apim-poc
+      .\07-Test-AIGateway.ps1
+
+
+Typical workflow
+----------------
+
+  1. Open PowerShell, navigate to the apim-poc folder
+  2. Pick one:
+       .\06-Create-AIGateway-SDK.ps1     (if you have Az modules)
+       .\06b-Create-AIGateway-REST.ps1   (if you don't)
+     Don't run both — they create the same thing.
+  3. Run .\07-Test-AIGateway.ps1
+  4. All 5 tests should pass.  The gateway is now live.
+
+
+What gets created
+-----------------
+
+  In APIM (apim-chubb-mcp-poc):
+
+    API:     Azure AI Gateway
+    Path:    /openai
+    Backend: https://foundry-test-0020.openai.azure.com/openai
+
+    Operations:
+      POST /openai/deployments/{id}/chat/completions
+      POST /openai/deployments/{id}/completions
+      POST /openai/deployments/{id}/embeddings
+      GET  /openai/models
+
+    Policy:
+      <set-header name="api-key" exists-action="delete" />
+      <authentication-managed-identity resource="https://cognitiveservices.azure.com" />
+
+  On the Foundry resource:
+    RBAC: "Cognitive Services OpenAI User" assigned to APIM's MI
+
+  The gateway URL for chat:
+    https://apim-chubb-mcp-poc.azure-api.net/openai/deployments/gpt-4.1/chat/completions?api-version=2024-12-01-preview
+
+
+Troubleshooting
+---------------
+
+  "Forbidden" from Foundry:
+    The RBAC role assignment hasn't propagated.  These can take up
+    to 5 minutes.  Wait and retry.
+
+  "API not found" or 404 from APIM:
+    Check the path — should be /openai (no trailing slash).  Also
+    make sure the deployment name matches exactly (gpt-4.1, case
+    sensitive).
+
+  "Identity not found":
+    MI enablement is still processing.  Run the setup script again —
+    it checks for existing MI and skips if already there.
+
+  Test 4 returns 401:
+    This can happen if the APIM policy strips the Authorization
+    header before it reaches the backend.  The MI policy replaces
+    it with its own token, so 401 here usually means the MI token
+    itself failed.  Check the role assignment.
+
+
+What this does NOT configure
+-----------------------------
+
+These scripts give you the basic gateway.  They don't set up:
+
+  - Products (grouping APIs for different consumer teams)
+  - Per-consumer subscription keys
+  - Rate limits or TPM quotas
+  - JWT validation on inbound calls
+
+For those, see APIM-Product-Based-Access-Control-Guide.txt.  You'd
+layer those on top of what these scripts create.

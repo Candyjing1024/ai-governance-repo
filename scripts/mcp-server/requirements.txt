@@ -1,0 +1,22 @@
+# Core web framework
+fastapi==0.115.3
+uvicorn[standard]==0.40.0
+gunicorn==23.0.0
+starlette
+
+# Azure SDK
+azure-identity==1.19.0
+azure-keyvault-secrets==4.7.0
+azure-search-documents==11.6.0b9
+azure-core==1.35.0
+
+# MCP
+fastmcp==2.14.1
+
+# AI Models
+openai==1.68.2
+
+# Utilities
+python-dotenv==1.2.1
+httpx-sse==0.4.3
+anyio==4.11.0

@@ -1,0 +1,62 @@
+AI Gateway - Quick Setup and Test Reference
+============================================
+
+What we did
+-----------
+We connected an existing APIM instance to an existing Azure AI Foundry
+resource using Managed Identity.  No API keys anywhere -- APIM gets a
+short-lived token on every request and passes it to Foundry automatically.
+
+The setup follows the approach described in Microsoft's documentation:
+  https://learn.microsoft.com/en-us/azure/api-management/api-management-authenticate-authorize-azure-openai
+  https://learn.microsoft.com/en-us/azure/ai-services/openai/how-to/managed-identity
+
+Steps (done via script, can also be done in portal):
+  1. Enable system-assigned managed identity on APIM
+  2. Assign "Cognitive Services OpenAI User" role to that identity
+  3. Create an API at path /openai pointing to the Foundry endpoint
+  4. Set inbound policy: strip api-key header, inject MI token
+
+
+Testing with curl
+-----------------
+
+Chat completion (no auth needed from the caller):
+
+  curl -s -X POST "https://<your-apim>.azure-api.net/openai/deployments/<model>/chat/completions?api-version=2024-12-01-preview" \
+    -H "Content-Type: application/json" \
+    -d '{"messages":[{"role":"user","content":"Say hello from the AI Gateway"}],"max_tokens":50}'
+
+Response:
+
+  {
+    "choices": [{
+      "message": {"role": "assistant", "content": "Hello from the AI Gateway!"},
+      "finish_reason": "stop"
+    }],
+    "model": "gpt-4.1-2025-04-14",
+    "usage": {"prompt_tokens": 18, "completion_tokens": 7, "total_tokens": 25}
+  }
+
+
+Bad model name (should return 404):
+
+  curl -s -X POST "https://<your-apim>.azure-api.net/openai/deployments/fake-model/chat/completions?api-version=2024-12-01-preview" \
+    -H "Content-Type: application/json" \
+    -d '{"messages":[{"role":"user","content":"fail"}],"max_tokens":10}'
+
+Response:
+
+  {
+    "error": {
+      "code": "DeploymentNotFound",
+      "message": "The API deployment for this resource does not exist."
+    }
+  }
+
+
+List models:
+
+  curl -s "https://<your-apim>.azure-api.net/openai/models?api-version=2024-12-01-preview"
+
+Returns the full list of models deployed on the Foundry resource.

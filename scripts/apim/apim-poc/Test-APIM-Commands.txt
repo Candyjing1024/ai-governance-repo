@@ -1,0 +1,60 @@
+# ============================================================
+# APIM + Foundry - Test Commands (PowerShell)
+# ============================================================
+# Copy-paste each command block into PowerShell one at a time.
+# ============================================================
+
+
+# ============================================================
+# COMMAND 1: Call LLM without token (expect 401)
+# ============================================================
+# This proves the endpoint is locked. No token = no access.
+
+Invoke-RestMethod -Method POST -Uri "https://<apim-service-name>.azure-api.net/openai/deployments/gpt-4.1/chat/completions?api-version=2024-12-01-preview" -ContentType "application/json" -Body '{"messages":[{"role":"user","content":"Hello"}],"max_tokens":50}'
+
+# Expected: 401 Unauthorized
+# "Access denied. Provide a valid Bearer token from POST /auth/token."
+
+
+# ============================================================
+# COMMAND 2: Get JWT token via APIM /auth/token
+# ============================================================
+# Uses Service Principal client credentials to get a Bearer token.
+
+$tokenResponse = Invoke-RestMethod -Method POST -Uri "https://<apim-service-name>.azure-api.net/auth/token" -ContentType "application/x-www-form-urlencoded" -Body "grant_type=client_credentials&client_id=<service-principal-client-id>&client_secret=<service-principal-client-secret>&scope=https://cognitiveservices.azure.com/.default"
+
+$token = $tokenResponse.access_token
+Write-Host "Token acquired: $($token.Substring(0,30))..."
+
+# Expected: 200 OK with access_token in the response
+
+
+# ============================================================
+# COMMAND 3: Call Chat Completions with token (expect 200)
+# ============================================================
+# Now call the LLM with the Bearer token. Should get a response.
+
+$response = Invoke-RestMethod -Method POST -Uri "https://<apim-service-name>.azure-api.net/openai/deployments/gpt-4.1/chat/completions?api-version=2024-12-01-preview" -Headers @{"Authorization"="Bearer $token";"Content-Type"="application/json"} -Body '{"messages":[{"role":"user","content":"What is Azure API Management in one line?"}],"max_tokens":100}'
+
+Write-Host "LLM says:"
+Write-Host $response.choices[0].message.content
+
+# Expected: 200 OK with LLM answer
+
+
+# ============================================================
+# COMMAND 4: Ask about Japanese culture
+# ============================================================
+
+$response = Invoke-RestMethod -Method POST -Uri "https://apim-chubb-mcp-poc.azure-api.net/openai/deployments/gpt-4.1/chat/completions?api-version=2024-12-01-preview" -Headers @{"Authorization"="Bearer $token";"Content-Type"="application/json"} -Body '{"messages":[{"role":"user","content":"Tell me 5 interesting facts about Japanese culture that most people dont know."}],"max_tokens":400}'
+
+Write-Host $response.choices[0].message.content
+
+
+# ============================================================
+# COMMAND 5: General knowledge question
+# ============================================================
+
+$response = Invoke-RestMethod -Method POST -Uri "https://apim-chubb-mcp-poc.azure-api.net/openai/deployments/gpt-4.1/chat/completions?api-version=2024-12-01-preview" -Headers @{"Authorization"="Bearer $token";"Content-Type"="application/json"} -Body '{"messages":[{"role":"user","content":"What are the top 5 tallest buildings in the world as of 2025?"}],"max_tokens":300}'
+
+Write-Host $response.choices[0].message.content

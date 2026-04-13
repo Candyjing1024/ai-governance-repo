@@ -1,0 +1,233 @@
+================================================================================
+  APIM + Azure OpenAI Semantic Caching
+  Problem & Solution Guide
+  Date: April 2026
+================================================================================
+
+PROBLEM
+-------
+When enabling semantic caching through the APIM portal wizard ("Apply
+semantic caching" tab), three messages block completion:
+
+  1. Blue banner - "Some of your Redis Enterprise instances are not
+     displayed in the list due to non-compliance with certain requirements."
+
+  2. Orange warning - "This operation will provision external cache for
+     whole API Management service..."
+
+  3. Red banner - "The current user does not have permissions to update
+     external cache."
+
+
+================================================================================
+SOLUTION 1: Redis not appearing in the dropdown
+================================================================================
+
+CAUSE: The Redis instance has Public network access = Disabled AND zero
+Private Endpoints. APIM cannot reach it, so the wizard hides it.
+
+REQUIREMENTS for the wizard to show a Redis instance:
+  - Azure Managed Redis (Enterprise tier)
+  - RediSearch module enabled (set at creation time only)
+  - Access key authentication = Enabled on the database
+  - Public network access = Enabled OR a Private Endpoint APIM can reach
+
+FIX (pick one):
+
+  Option A - Enable public access (quick/POC):
+    Portal: Redis > Settings > Networking > Public network access > Enabled
+
+    az rest --method PATCH `
+      --url "https://management.azure.com/subscriptions/{sub-id}/resourceGroups/{rg}/providers/Microsoft.Cache/redisEnterprise/{redis-name}?api-version=2024-09-01-preview" `
+      --body '{"properties":{"publicNetworkAccess":"Enabled"}}'
+
+  Option B - Create a Private Endpoint (production):
+    Portal: Redis > Networking > Private endpoint connections > + Add
+    Select the VNet/subnet APIM can reach.
+    Note: Consumption-tier APIM does not support VNet injection.
+
+VERIFY:
+  az rest --method GET `
+    --url "https://management.azure.com/subscriptions/{sub-id}/resourceGroups/{rg}/providers/Microsoft.Cache/redisEnterprise/{redis-name}/databases/default?api-version=2024-09-01-preview" `
+    --query "{modules:properties.modules[].name, accessKeys:properties.accessKeysAuthentication}" -o json
+  # Expect: modules=["RediSearch"], accessKeys="Enabled"
+
+
+================================================================================
+SOLUTION 2: Cache invalidation warning
+================================================================================
+
+CAUSE: Informational only. Not a blocker.
+
+This appears on every APIM instance when first linking an external cache.
+It warns that existing <cache-lookup>/<cache-store> policies (non-semantic)
+that don't explicitly specify caching-type="internal" will switch to the
+new external Redis cache, causing temporary cache misses.
+
+FIX: Acknowledge and proceed. If you have existing non-semantic caching
+policies to keep on internal cache, add caching-type="internal" to them:
+
+  <cache-lookup caching-type="internal" ... />
+  <cache-store caching-type="internal" ... />
+
+
+================================================================================
+SOLUTION 3: "does not have permissions to update external cache"
+================================================================================
+
+CAUSE: The portal wizard calls listKeys on the Redis database and updates
+the APIM external cache entity. Both require specific RBAC roles.
+
+KEY FINDING: "Redis Cache Contributor" is NOT sufficient for Azure Managed
+Redis (Enterprise). The listKeys action requires the full "Contributor"
+role at the Redis resource scope.
+
+Additionally, access key authentication must be Enabled on the Redis
+database. If disabled, listKeys fails even with correct RBAC.
+
+FIX - 4 steps:
+
+  Step 1: Assign "Contributor" to the portal user on the Redis resource
+
+    az role assignment create `
+      --assignee "{user-object-id}" `
+      --assignee-principal-type User `
+      --role "Contributor" `
+      --scope "/subscriptions/{sub-id}/resourceGroups/{rg}/providers/Microsoft.Cache/redisEnterprise/{redis-name}"
+
+  Step 2: Assign "Contributor" to the APIM managed identity on the Redis
+
+    # Get the APIM system MI principal ID:
+    az apim show --name {apim-name} -g {rg} --query "identity.principalId" -o tsv
+
+    az role assignment create `
+      --assignee-object-id "{apim-mi-principal-id}" `
+      --assignee-principal-type ServicePrincipal `
+      --role "Contributor" `
+      --scope "/subscriptions/{sub-id}/resourceGroups/{rg}/providers/Microsoft.Cache/redisEnterprise/{redis-name}"
+
+  Step 3: Assign "Cognitive Services OpenAI User" to the APIM MI on the
+          Azure AI Services resource (for MI auth to embeddings + chat)
+
+    az role assignment create `
+      --assignee-object-id "{apim-mi-principal-id}" `
+      --assignee-principal-type ServicePrincipal `
+      --role "Cognitive Services OpenAI User" `
+      --scope "/subscriptions/{sub-id}/resourceGroups/{rg}/providers/Microsoft.CognitiveServices/accounts/{ai-resource}"
+
+  Step 4: Verify access keys are enabled and listKeys works
+
+    az rest --method GET `
+      --url "https://management.azure.com/subscriptions/{sub-id}/resourceGroups/{rg}/providers/Microsoft.Cache/redisEnterprise/{redis-name}/databases/default?api-version=2024-09-01-preview" `
+      --query "properties.accessKeysAuthentication" -o tsv
+    # Must return "Enabled". If not:
+    az rest --method PATCH `
+      --url "...same url..." `
+      --body '{"properties":{"accessKeysAuthentication":"Enabled"}}'
+
+    az rest --method POST `
+      --url "https://management.azure.com/subscriptions/{sub-id}/resourceGroups/{rg}/providers/Microsoft.Cache/redisEnterprise/{redis-name}/databases/default/listKeys?api-version=2024-09-01-preview" `
+      -o json
+    # Must return primaryKey and secondaryKey
+
+
+================================================================================
+BYPASS: CLI Alternative if Portal Wizard Still Fails
+================================================================================
+
+The entire setup can be done via REST API, skipping the portal wizard.
+
+  STEP A - Link Redis to APIM as external cache:
+
+    $keys = az rest --method POST `
+      --url ".../databases/default/listKeys?api-version=2024-09-01-preview" `
+      -o json | ConvertFrom-Json
+    $conn = "{host}:10000,password=$($keys.primaryKey),ssl=True,abortConnect=False"
+    $json = '{"properties":{"connectionString":"' + $conn + '","useFromLocation":"default"}}'
+    [IO.File]::WriteAllText("$env:TEMP\c.json",$json,[Text.UTF8Encoding]::new($false))
+    az rest --method PUT `
+      --url ".../Microsoft.ApiManagement/service/{apim}/caches/default?api-version=2023-09-01-preview" `
+      --body "@$env:TEMP\c.json" --headers "Content-Type=application/json"
+
+  STEP B - Create embeddings backend (URL MUST include full deployment path):
+
+    $json = '{"properties":{"url":"https://{ai-resource}.openai.azure.com/openai/deployments/{embeddings-model}/embeddings","protocol":"http"}}'
+    [IO.File]::WriteAllText("$env:TEMP\b.json",$json,[Text.UTF8Encoding]::new($false))
+    az rest --method PUT `
+      --url ".../backends/embeddings-backend?api-version=2023-09-01-preview" `
+      --body "@$env:TEMP\b.json" --headers "Content-Type=application/json"
+
+  STEP C - Apply semantic cache policy to chat-completions operation:
+
+    $xml = '<policies>
+      <inbound><base />
+        <azure-openai-semantic-cache-lookup score-threshold="0.15"
+          embeddings-backend-id="embeddings-backend"
+          embeddings-backend-auth="system-assigned" />
+      </inbound>
+      <backend><base /></backend>
+      <outbound><base />
+        <azure-openai-semantic-cache-store duration="60" />
+      </outbound>
+      <on-error><base /></on-error>
+    </policies>'
+    $body = @{properties=@{value=$xml;format="xml"}}|ConvertTo-Json -Depth 3
+    [IO.File]::WriteAllText("$env:TEMP\p.json",$body,[Text.UTF8Encoding]::new($false))
+    az rest --method PUT `
+      --url ".../apis/{api-id}/operations/{op-id}/policies/policy?api-version=2023-09-01-preview" `
+      --body "@$env:TEMP\p.json" --headers "Content-Type=application/json"
+
+
+================================================================================
+REQUIRED SETTINGS SUMMARY
+================================================================================
+
+  COMPONENT          | SETTING                          | REQUIRED VALUE
+  -------------------|----------------------------------|-------------------
+  Redis              | SKU                              | Balanced B0+
+  Redis              | Module                           | RediSearch (set at creation)
+  Redis              | Clustering Policy                | EnterpriseCluster
+  Redis              | Public network access            | Enabled (or PE)
+  Redis              | Access key authentication        | Enabled
+  Redis DB           | listKeys must succeed            | Yes
+  APIM               | System-assigned Managed Identity | Enabled
+  APIM MI -> Redis   | RBAC Role                        | Contributor
+  APIM MI -> AI Svc  | RBAC Role                        | Cognitive Services OpenAI User
+  User -> Redis      | RBAC Role                        | Contributor
+  AI Services        | Embeddings model deployed        | text-embedding-3-small (or equiv)
+  Backend URL        | Format                           | .../deployments/{model}/embeddings
+  Policy             | score-threshold                  | 0.05-0.15 (NOT 0.8)
+  API calls          | api-version                      | 2024-10-21 (not model version)
+
+
+================================================================================
+SCORE-THRESHOLD QUICK REFERENCE
+================================================================================
+
+  The score-threshold is the max VECTOR DISTANCE (not min similarity).
+
+  0.05  = Very strict. Near-identical prompts only. Safe, fewer hits.
+  0.15  = Recommended. Catches paraphrases, rejects unrelated topics.
+  0.20+ = Risk of returning wrong cached answers for different prompts.
+  0.80  = Dangerous. Tested: "submarines" matched "car engines."
+
+  Start at 0.05, tune up to 0.15. Never exceed 0.20 in production.
+
+
+================================================================================
+CHECKLIST
+================================================================================
+
+  [ ] 1. Redis networking: Enable public access OR create Private Endpoint
+  [ ] 2. Redis access keys: Verify authentication = Enabled
+  [ ] 3. RBAC: "Contributor" to portal user on Redis resource
+  [ ] 4. RBAC: "Contributor" to APIM managed identity on Redis resource
+  [ ] 5. RBAC: "Cognitive Services OpenAI User" to APIM MI on AI resource
+  [ ] 6. Embeddings model: text-embedding-3-small deployed on AI resource
+  [ ] 7. Retry the wizard (or use CLI bypass above)
+  [ ] 8. Set score-threshold to 0.15
+  [ ] 9. Use api-version=2024-10-21 for chat completions, not model version
+
+================================================================================
+END OF DOCUMENT
+================================================================================

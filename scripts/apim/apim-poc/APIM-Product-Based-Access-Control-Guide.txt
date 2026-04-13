@@ -1,0 +1,603 @@
+APIM Product-Based Access Control — Mapping Service Principals to Subscription Keys
+=====================================================================================
+
+Prepared by: Chubb AI Governance Team
+Last Updated: March 2026
+
+
+Overview
+--------
+
+This document covers the evolved architecture where APIM uses Products and Subscription
+Keys to control which Service Principals can access which models. Instead of a single
+open passthrough, each consumer gets a subscription key tied to a specific product that
+limits them to certain model deployments and enforces tokens-per-minute (TPM) quotas.
+
+
+Architecture
+------------
+
+    +---------------------------+          +------------------------------------------+
+    | Foundry Resource          |          | API Management Service                   |
+    | (foundry-mvp-eastus2)     |          |                                          |
+    |                           |          |  APIM APIs:                              |
+    |  Foundry Project Default  |          |    - Auth API                            |
+    |  (restricted to 1)        |          |      Federates token gen to Entra        |
+    |                           |          |      based on Client ID + Secret         |
+    |  Foundry Assets:          |          |                                          |
+    |    - Models               |          |    - Foundry Passthrough API             |
+    |    - MCPs                 |          |      Policy Enforced:                    |
+    |                           |          |      1. Validate Auth JWT                |
+    +---------------------------+          |      2. Identify Product from Sub-Key    |
+              |                            |      3. Enforce allowed models           |
+              |                            |      4. Forward to Foundry Backend       |
+              v                            |                                          |
+    Foundry Service Endpoint               |  APIM Products:                          |
+    https://foundry-mvp-                   |    - foundry-gpt5.4-product              |
+    eastus2.services.ai.azure.com/         |      Allow only gpt5.4 + TPM            |
+                                           |    - foundry-gpt5.3-chat-product         |
+    Supports:                              |      Allow only gpt5.3-chat + TPM       |
+      - API Key based auth                 |    - foundry-all-models-product          |
+      - Managed Identity auth              |      Allow all models + TPM             |
+                                           |                                          |
+                                           |  APIM Backend Registry:                  |
+                                           |    foundry-mvp-eastus2.services.         |
+                                           |    ai.azure.com                          |
+                                           |    MI Auth Credential enabled            |
+                                           |                                          |
+                                           |  APIM Subscriptions:                     |
+                                           |    Tied to products, generates unique    |
+                                           |    subscription keys per consumer        |
+                                           +------------------------------------------+
+
+
+How the Flow Works
+------------------
+
+1. Consumer app (with an SP) calls POST /auth/token with client_id + client_secret
+2. APIM Auth API proxies to Microsoft Entra, returns a JWT
+3. Consumer calls POST /foundry/deployments/<model>/chat/completions with:
+     - Authorization: Bearer <jwt>
+     - Ocp-Apim-Subscription-Key: <their-subscription-key>
+4. APIM Passthrough API policy:
+     a. Validates the JWT (is it a real Entra token?)
+     b. Identifies the product from the subscription key
+     c. Product-level policy enforces which models are allowed
+     d. If allowed, strips the caller's auth header
+     e. Injects Managed Identity credential for Foundry
+     f. Forwards to the Foundry backend
+
+
+The Problem
+-----------
+
+We need to map multiple Service Principals to subscription keys, and each SP should
+only be allowed to access certain models. For example:
+
+  - SP-A (Team Alpha)  -> gpt5.4 only
+  - SP-B (Team Beta)   -> gpt5.3-chat only
+  - SP-C (Platform)    -> all models
+
+Three solutions follow, from simplest to most robust.
+
+
+================================================================================
+SOLUTION 1: Manual Product Subscriptions (Simplest)
+================================================================================
+
+Best for: POC or fewer than 20 Service Principals.
+
+In this approach, you create one APIM subscription per SP per product, and track
+the mapping manually. APIM handles the sub-key validation and product-level
+model enforcement automatically.
+
+Step 1: Create Products in APIM Portal
+.......................................
+
+1. Open APIM > left menu > Products > + Add
+2. Create three products:
+
+   Product 1:
+     - Display name  : foundry-gpt5.4-product
+     - ID            : foundry-gpt5-4-product
+     - Description   : Access to gpt5.4 deployment only
+     - Requires subscription : Yes
+     - Requires approval     : Yes
+     - State                 : Published
+
+   Product 2:
+     - Display name  : foundry-gpt5.3-chat-product
+     - ID            : foundry-gpt5-3-chat-product
+     - Description   : Access to gpt5.3-chat deployment only
+     - Requires subscription : Yes
+     - Requires approval     : Yes
+     - State                 : Published
+
+   Product 3:
+     - Display name  : foundry-all-models-product
+     - ID            : foundry-all-models-product
+     - Description   : Access to all model deployments
+     - Requires subscription : Yes
+     - Requires approval     : Yes
+     - State                 : Published
+
+3. For each product, go to the APIs tab and add the "Foundry Passthrough API"
+
+
+Step 2: Register the Foundry Backend with Managed Identity
+..........................................................
+
+1. APIM > left menu > Backends > + Add
+2. Fill in:
+     - Name     : foundry-backend
+     - Type     : Custom URL
+     - Runtime URL : https://foundry-mvp-eastus2.services.ai.azure.com/
+3. Under Authorization:
+     - Header name  : (leave empty, we use managed identity in policy)
+4. Click Create
+
+5. Make sure APIM's system-assigned Managed Identity is enabled:
+     - APIM > left menu > Managed identities > System assigned > Status: On
+
+6. Assign the APIM managed identity the role "Cognitive Services OpenAI User"
+   on the Foundry resource:
+     - Foundry resource > Access control (IAM) > + Add role assignment
+     - Role: Cognitive Services OpenAI User
+     - Assign access to: Managed identity
+     - Select: your APIM instance
+
+
+Step 3: Create the Foundry Passthrough API
+...........................................
+
+1. APIM > left menu > APIs > + Add API > HTTP
+2. Fill in:
+     - Display name          : Foundry Passthrough API
+     - Name                  : foundry-passthrough
+     - Web service URL       : https://foundry-mvp-eastus2.services.ai.azure.com/openai
+     - API URL suffix        : foundry
+     - Subscription required : Yes (this is the key difference from the POC)
+3. Click Create
+
+4. Add a wildcard operation to handle all model paths:
+     - Display name : Passthrough
+     - Method       : POST
+     - URL          : /deployments/{deployment-id}/chat/completions
+     (Or for full flexibility, use a wildcard: /* )
+
+5. Under Query tab, add:
+     - Name: api-version, Default: 2024-12-01-preview, Required: Yes
+
+
+Step 4: Set the Passthrough API Inbound Policy
+...............................................
+
+Click All operations > Inbound processing > </> and paste:
+
+<policies>
+    <inbound>
+        <base />
+        <!-- 1. Validate JWT from Microsoft Entra -->
+        <validate-jwt header-name="Authorization"
+                      failed-validation-httpcode="401"
+                      failed-validation-error-message="Invalid or missing Bearer token.">
+            <openid-config url="https://login.microsoftonline.com/<YOUR_TENANT_ID>/v2.0/.well-known/openid-configuration" />
+            <audiences>
+                <audience>https://cognitiveservices.azure.com</audience>
+            </audiences>
+            <issuers>
+                <issuer>https://sts.windows.net/<YOUR_TENANT_ID>/</issuer>
+            </issuers>
+        </validate-jwt>
+        <!-- 2. Strip caller's Authorization header -->
+        <set-header name="Authorization" exists-action="delete" />
+        <!-- 3. Authenticate to Foundry using APIM's Managed Identity -->
+        <authentication-managed-identity resource="https://cognitiveservices.azure.com" />
+        <!-- 4. Route to Foundry backend -->
+        <set-backend-service backend-id="foundry-backend" />
+    </inbound>
+    <backend>
+        <base />
+    </backend>
+    <outbound>
+        <base />
+    </outbound>
+    <on-error>
+        <base />
+    </on-error>
+</policies>
+
+
+Step 5: Set Product-Level Policies (Model Restriction + TPM)
+.............................................................
+
+For each product, go to Products > select product > Policies > </> and paste:
+
+foundry-gpt5.4-product policy:
+
+<policies>
+    <inbound>
+        <base />
+        <choose>
+            <when condition="@(!context.Request.Url.Path.Contains("/deployments/gpt5.4/"))">
+                <return-response>
+                    <set-status code="403" reason="Forbidden" />
+                    <set-header name="Content-Type" exists-action="override">
+                        <value>application/json</value>
+                    </set-header>
+                    <set-body>{"error": "This subscription only allows access to gpt5.4."}</set-body>
+                </return-response>
+            </when>
+        </choose>
+        <rate-limit-by-key calls="100" renewal-period="60"
+                           counter-key="@(context.Subscription.Id)" />
+    </inbound>
+    <backend><base /></backend>
+    <outbound><base /></outbound>
+    <on-error><base /></on-error>
+</policies>
+
+
+foundry-gpt5.3-chat-product policy:
+
+<policies>
+    <inbound>
+        <base />
+        <choose>
+            <when condition="@(!context.Request.Url.Path.Contains("/deployments/gpt5.3-chat/"))">
+                <return-response>
+                    <set-status code="403" reason="Forbidden" />
+                    <set-header name="Content-Type" exists-action="override">
+                        <value>application/json</value>
+                    </set-header>
+                    <set-body>{"error": "This subscription only allows access to gpt5.3-chat."}</set-body>
+                </return-response>
+            </when>
+        </choose>
+        <rate-limit-by-key calls="100" renewal-period="60"
+                           counter-key="@(context.Subscription.Id)" />
+    </inbound>
+    <backend><base /></backend>
+    <outbound><base /></outbound>
+    <on-error><base /></on-error>
+</policies>
+
+
+foundry-all-models-product policy:
+
+<policies>
+    <inbound>
+        <base />
+        <!-- No model restriction - all deployments allowed -->
+        <rate-limit-by-key calls="500" renewal-period="60"
+                           counter-key="@(context.Subscription.Id)" />
+    </inbound>
+    <backend><base /></backend>
+    <outbound><base /></outbound>
+    <on-error><base /></on-error>
+</policies>
+
+
+Step 6: Create Subscriptions for Each SP
+.........................................
+
+1. APIM > left menu > Subscriptions > + Add subscription
+2. For each SP, create a subscription:
+
+   Subscription 1:
+     - Name    : team-alpha-gpt54
+     - Scope   : Product > foundry-gpt5.4-product
+     - Click Create
+
+   Subscription 2:
+     - Name    : team-beta-gpt53chat
+     - Scope   : Product > foundry-gpt5.3-chat-product
+     - Click Create
+
+   Subscription 3:
+     - Name    : platform-all-models
+     - Scope   : Product > foundry-all-models-product
+     - Click Create
+
+3. After creation, click the "..." menu > Show/hide keys to copy the Primary key
+4. Give each team their subscription key
+
+
+Step 7: Create the Auth API (Token Generation)
+...............................................
+
+Same as the POC setup:
+
+1. APIM > APIs > + Add API > HTTP
+2. Fill in:
+     - Display name          : Auth - Token Generation
+     - Name                  : auth-api
+     - Web service URL       : https://login.microsoftonline.com
+     - API URL suffix        : auth
+     - Subscription required : No (anyone can request a token, auth is via SP credentials)
+3. Add operation: POST /token
+4. Policy:
+
+<policies>
+    <inbound>
+        <base />
+        <set-backend-service base-url="https://login.microsoftonline.com/<YOUR_TENANT_ID>/oauth2/v2.0" />
+        <rewrite-uri template="/token" copy-unmatched-params="true" />
+    </inbound>
+    <backend><base /></backend>
+    <outbound><base /></outbound>
+    <on-error><base /></on-error>
+</policies>
+
+
+Step 8: Testing
+...............
+
+Test 1: Get a token (same as before)
+
+  POST https://<your-apim>.azure-api.net/auth/token
+  Content-Type: application/x-www-form-urlencoded
+
+  grant_type=client_credentials
+  &client_id=<SP_CLIENT_ID>
+  &client_secret=<SP_CLIENT_SECRET>
+  &scope=https://cognitiveservices.azure.com/.default
+
+
+Test 2: Call gpt5.4 with Team Alpha's sub-key (expect 200)
+
+  POST https://<your-apim>.azure-api.net/foundry/deployments/gpt5.4/chat/completions?api-version=2024-12-01-preview
+  Content-Type: application/json
+  Authorization: Bearer <jwt-token>
+  Ocp-Apim-Subscription-Key: <team-alpha-subscription-key>
+
+  {"messages":[{"role":"user","content":"Hello"}],"max_tokens":50}
+
+
+Test 3: Call gpt5.3-chat with Team Alpha's sub-key (expect 403)
+
+  POST https://<your-apim>.azure-api.net/foundry/deployments/gpt5.3-chat/chat/completions?api-version=2024-12-01-preview
+  Content-Type: application/json
+  Authorization: Bearer <jwt-token>
+  Ocp-Apim-Subscription-Key: <team-alpha-subscription-key>
+
+  {"messages":[{"role":"user","content":"Hello"}],"max_tokens":50}
+
+  Expected: 403 "This subscription only allows access to gpt5.4."
+
+
+Test 4: Call gpt5.3-chat with Team Beta's sub-key (expect 200)
+
+  POST https://<your-apim>.azure-api.net/foundry/deployments/gpt5.3-chat/chat/completions?api-version=2024-12-01-preview
+  Content-Type: application/json
+  Authorization: Bearer <jwt-token>
+  Ocp-Apim-Subscription-Key: <team-beta-subscription-key>
+
+  {"messages":[{"role":"user","content":"Hello"}],"max_tokens":50}
+
+
+Pros: Simple to set up, no custom code, APIM handles sub-key validation automatically.
+Cons: Manual subscription management, no automated binding between SP and sub-key.
+
+
+================================================================================
+SOLUTION 2: JWT Claim-Based Product Enforcement (Medium)
+================================================================================
+
+Best for: 20-100 Service Principals. Adds a layer where the SP identity in the JWT
+is cross-checked against the product.
+
+This builds on Solution 1 by adding an extra check: even if someone leaks a
+subscription key, the JWT must also belong to an SP that is authorized for that product.
+
+Additional Step: Store Allowed SPs per Product in Named Values
+..............................................................
+
+1. APIM > left menu > Named values > + Add
+2. Create one Named Value per product:
+
+   Name  : sp-allow-foundry-gpt5-4-product
+   Type  : Plain
+   Value : clientId-of-SP-A,clientId-of-SP-B
+
+   Name  : sp-allow-foundry-gpt5-3-chat-product
+   Type  : Plain
+   Value : clientId-of-SP-C
+
+   Name  : sp-allow-foundry-all-models-product
+   Type  : Plain
+   Value : clientId-of-SP-D,clientId-of-SP-E
+
+Additional Policy: Add After validate-jwt in Passthrough API
+............................................................
+
+Add this block right after the validate-jwt element:
+
+        <!-- Extract SP client ID from JWT appid claim -->
+        <set-variable name="caller-app-id" value="@{
+            var authHeader = context.Request.Headers.GetValueOrDefault("Authorization", "");
+            if (authHeader.StartsWith("Bearer ")) {
+                var token = authHeader.Substring(7);
+                var parts = token.Split('.');
+                if (parts.Length == 3) {
+                    var payload = System.Text.Encoding.UTF8.GetString(
+                        Convert.FromBase64String(parts[1].PadRight(parts[1].Length + (4 - parts[1].Length % 4) % 4, '=')));
+                    var json = Newtonsoft.Json.Linq.JObject.Parse(payload);
+                    return json["appid"]?.ToString() ?? "";
+                }
+            }
+            return "";
+        }" />
+
+        <!-- Cross-check: SP must be in the allowed list for this product -->
+        <choose>
+            <when condition="@{
+                var appId = (string)context.Variables["caller-app-id"];
+                if (string.IsNullOrEmpty(appId)) return true;
+                var productName = context.Product?.Name ?? "";
+                string allowedRaw = "";
+                if (productName == "foundry-gpt5-4-product")
+                    allowedRaw = "{{sp-allow-foundry-gpt5-4-product}}";
+                else if (productName == "foundry-gpt5-3-chat-product")
+                    allowedRaw = "{{sp-allow-foundry-gpt5-3-chat-product}}";
+                else if (productName == "foundry-all-models-product")
+                    allowedRaw = "{{sp-allow-foundry-all-models-product}}";
+                return !allowedRaw.Split(',').Contains(appId);
+            }">
+                <return-response>
+                    <set-status code="403" reason="Forbidden" />
+                    <set-header name="Content-Type" exists-action="override">
+                        <value>application/json</value>
+                    </set-header>
+                    <set-body>{"error": "This Service Principal is not authorized for this product."}</set-body>
+                </return-response>
+            </when>
+        </choose>
+
+Pros: Dual enforcement (JWT identity + sub-key). Leaked sub-key alone is useless.
+Cons: Named Values need manual updates when onboarding new SPs.
+
+
+================================================================================
+SOLUTION 3: Entra App Roles + Product Mapping (Enterprise Grade)
+================================================================================
+
+Best for: 100+ Service Principals or production. Access control lives in Entra,
+not in APIM Named Values. Fully auditable through Azure AD logs.
+
+Step 1: Define App Roles on the App Registration
+.................................................
+
+1. Azure Portal > Azure Active Directory > App registrations > your auth app
+2. Left menu > App roles > + Create app role
+
+   Role 1:
+     - Display name         : GPT 5.4 Access
+     - Allowed member types : Applications
+     - Value                : Foundry.GPT54.Access
+     - Description          : Allows access to gpt5.4 deployment
+
+   Role 2:
+     - Display name         : GPT 5.3 Chat Access
+     - Allowed member types : Applications
+     - Value                : Foundry.GPT53Chat.Access
+     - Description          : Allows access to gpt5.3-chat deployment
+
+   Role 3:
+     - Display name         : All Models Access
+     - Allowed member types : Applications
+     - Value                : Foundry.AllModels.Access
+     - Description          : Allows access to all model deployments
+
+
+Step 2: Assign Roles to Service Principals
+..........................................
+
+1. Azure Portal > Enterprise Applications > search for the SP (e.g. sp-team-alpha)
+2. Left menu > Users and groups > + Add assignment
+3. Select the role (e.g. "GPT 5.4 Access")
+4. Click Assign
+
+Repeat for each SP with their appropriate role(s).
+
+
+Step 3: The JWT Now Contains a "roles" Claim
+.............................................
+
+When the SP requests a token, the JWT payload will include:
+
+  {
+    "appid": "de39560f-...",
+    "roles": ["Foundry.GPT54.Access"],
+    ...
+  }
+
+
+Step 4: Add Role-Based Policy to Passthrough API
+.................................................
+
+Add this block after validate-jwt, instead of the Named Value check:
+
+        <!-- Extract roles from JWT -->
+        <set-variable name="caller-roles" value="@{
+            var authHeader = context.Request.Headers.GetValueOrDefault("Authorization", "");
+            if (authHeader.StartsWith("Bearer ")) {
+                var token = authHeader.Substring(7);
+                var parts = token.Split('.');
+                if (parts.Length == 3) {
+                    var payload = System.Text.Encoding.UTF8.GetString(
+                        Convert.FromBase64String(parts[1].PadRight(parts[1].Length + (4 - parts[1].Length % 4) % 4, '=')));
+                    var json = Newtonsoft.Json.Linq.JObject.Parse(payload);
+                    var roles = json["roles"];
+                    if (roles != null) return string.Join(",", roles.Select(r => r.ToString()));
+                }
+            }
+            return "";
+        }" />
+
+        <!-- Enforce: SP must have the role matching the product -->
+        <choose>
+            <when condition="@{
+                var product = context.Product?.Name ?? "";
+                var roles = ((string)context.Variables["caller-roles"]).Split(',');
+
+                if (product == "foundry-gpt5-4-product")
+                    return !roles.Contains("Foundry.GPT54.Access")
+                        && !roles.Contains("Foundry.AllModels.Access");
+
+                if (product == "foundry-gpt5-3-chat-product")
+                    return !roles.Contains("Foundry.GPT53Chat.Access")
+                        && !roles.Contains("Foundry.AllModels.Access");
+
+                if (product == "foundry-all-models-product")
+                    return !roles.Contains("Foundry.AllModels.Access");
+
+                return true;
+            }">
+                <return-response>
+                    <set-status code="403" reason="Forbidden" />
+                    <set-header name="Content-Type" exists-action="override">
+                        <value>application/json</value>
+                    </set-header>
+                    <set-body>{"error": "Service Principal lacks the required App Role for this product."}</set-body>
+                </return-response>
+            </when>
+        </choose>
+
+Pros: Centralized in Entra, auditable, scalable, self-documenting through Azure AD.
+Cons: Requires Entra admin to define roles and assign them.
+
+
+================================================================================
+Recommendation
+================================================================================
+
+For Chubb, our recommendation:
+
+  1. Start with Solution 1 for the POC
+     - Products + Subscriptions + Passthrough API with JWT + Managed Identity
+     - Fast to implement, proves the product-based model restriction works
+     - Handles the immediate need: different teams get different model access
+
+  2. Add Solution 2 for the MVP
+     - Named Values cross-checking SP identity against product
+     - Prevents sub-key leakage from granting unauthorized access
+
+  3. Upgrade to Solution 3 for Production
+     - App Roles in Entra for fully auditable, centralized access control
+     - Integrates with Entra's audit trail and Conditional Access policies
+
+
+Key Differences from the Basic POC
+-----------------------------------
+
+  +----------------------------+---------------------------+------------------------------+
+  |                            | Basic POC (completed)     | Product-Based (this guide)   |
+  +----------------------------+---------------------------+------------------------------+
+  | Auth to Foundry            | API Key via Named Value   | Managed Identity             |
+  | Subscription required      | No                        | Yes                          |
+  | Model restriction          | None (any deployment)     | Per-product policy           |
+  | TPM rate limiting          | None                      | Per-subscription             |
+  | SP-to-model mapping        | None (any SP, any model)  | Subscription + product       |
+  | Backend registration       | Inline set-backend-service| APIM Backend Registry        |
+  +----------------------------+---------------------------+------------------------------+

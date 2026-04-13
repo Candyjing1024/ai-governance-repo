@@ -1,0 +1,535 @@
+================================================================================
+  CHUBB AI GOVERNANCE - AZURE AI FOUNDRY AGENT SETUP GUIDE
+  Wrapping Astra Backend with Azure AI Foundry Agent
+  Date: March 10, 2026
+================================================================================
+
+TABLE OF CONTENTS
+-----------------
+1. Overview
+2. Prerequisites & Deployed Infrastructure
+3. Foundry Hub & Project Creation (Automated via Script)
+4. OpenAI Connection Setup
+5. RBAC Permissions Configuration
+6. OpenAPI Spec for Backend
+7. Foundry Agent Creation (Automated via Script)
+8. End-to-End Testing (Automated via Script)
+9. How to Do the Same Manually via Azure Portal UI
+10. Architecture Diagram
+11. Resource Reference
+
+
+================================================================================
+1. OVERVIEW
+================================================================================
+
+We wrapped the already-deployed Chubb AI Governance POC backend (Astra multi-
+agent system) with an Azure AI Foundry Agent. This allows the agent to be
+accessed and tested from the Azure AI Foundry UI Playground, as well as
+programmatically via the Azure AI Agents SDK.
+
+End-to-end flow:
+
+  User (Foundry Playground or SDK)
+    -> Foundry Agent (gpt-4o)
+      -> OpenAPI Tool ("askAstra")
+        -> App Service Backend (app-chubb-backend-poc/chat)
+          -> LangGraph Supervisor
+            -> Domain Agent
+              -> MCP Server (app-chubb-mcp-poc)
+                -> Azure AI Search (Chubb governance knowledge base)
+
+
+================================================================================
+2. PREREQUISITES & DEPLOYED INFRASTRUCTURE
+================================================================================
+
+The Chubb POC code was deployed to Azure with the following resources already
+in place before the Foundry Agent work began:
+
+  Subscription:     Visual Studio Enterprise (a3223db3-76f2-4a7c-8684-57b835dc77e7)
+  Resource Group:   rg-chubb-mcp-poc
+  Location:         East US
+
+  Already Deployed:
+  - Azure OpenAI:   oai-chubb-mcp-9342 (gpt-4o @ 30K TPM, text-embedding-3-large)
+  - App Service:    app-chubb-backend-poc (FastAPI + LangGraph backend)
+  - App Service:    app-chubb-mcp-poc (FastMCP server with domain_search tool)
+  - AI Search:      srch-chubb-mcp-9342 (Chubb governance document index)
+  - Cosmos DB:      cosmos-chubb-mcp-poc (checkpointing & conversation logs)
+  - Key Vault:      kv-chubb-mcp-9342 (secrets management)
+  - App Insights:   appi-chubb-mcp-poc (monitoring)
+
+  Python SDK Versions Required:
+  - azure-ai-agents >= 1.1.0
+  - azure-ai-projects >= 1.0.0
+  - azure-identity
+  - requests
+
+
+================================================================================
+3. FOUNDRY HUB & PROJECT CREATION (AUTOMATED VIA SCRIPT)
+================================================================================
+
+Script: create_foundry_hub_project.py
+
+This script uses Azure REST API (ARM) to create the AI Foundry Hub and Project.
+
+STEP 3a: Create AI Foundry Hub
+-------------------------------
+API Call:
+  PUT https://management.azure.com/subscriptions/{subscriptionId}/resourceGroups/
+      rg-chubb-mcp-poc/providers/Microsoft.MachineLearningServices/workspaces/
+      hub-chubb-mcp-poc?api-version=2024-10-01
+
+Request Body:
+  {
+    "location": "eastus",
+    "kind": "Hub",
+    "identity": { "type": "SystemAssigned" },
+    "properties": {
+      "friendlyName": "Chubb AI MCP Hub",
+      "description": "AI Foundry Hub for Chubb AI Governance POC"
+    },
+    "sku": { "name": "Basic", "tier": "Basic" }
+  }
+
+Result: Hub "hub-chubb-mcp-poc" created (HTTP 202, polled until Succeeded).
+
+
+STEP 3b: Create AI Foundry Project (under Hub)
+-----------------------------------------------
+API Call:
+  PUT https://management.azure.com/subscriptions/{subscriptionId}/resourceGroups/
+      rg-chubb-mcp-poc/providers/Microsoft.MachineLearningServices/workspaces/
+      proj-chubb-mcp-poc?api-version=2024-10-01
+
+Request Body:
+  {
+    "location": "eastus",
+    "kind": "Project",
+    "identity": { "type": "SystemAssigned" },
+    "properties": {
+      "friendlyName": "Chubb AI MCP Project",
+      "description": "AI Foundry Project for Chubb AI Governance Agent",
+      "hubResourceId": "/subscriptions/{subscriptionId}/resourceGroups/
+          rg-chubb-mcp-poc/providers/Microsoft.MachineLearningServices/
+          workspaces/hub-chubb-mcp-poc"
+    },
+    "sku": { "name": "Basic", "tier": "Basic" }
+  }
+
+Key: The "hubResourceId" links the project to the hub.
+
+Result: Project "proj-chubb-mcp-poc" created (HTTP 202, polled until Succeeded).
+
+
+How to run:
+  cd chubb-ai-governance-mcp-main
+  python create_foundry_hub_project.py
+
+
+================================================================================
+4. OPENAI CONNECTION SETUP
+================================================================================
+
+The Hub needs a connection to the existing Azure OpenAI resource so the agent
+can use the gpt-4o model.
+
+API Call (also in create_foundry_hub_project.py):
+  PUT https://management.azure.com/subscriptions/{subscriptionId}/resourceGroups/
+      rg-chubb-mcp-poc/providers/Microsoft.MachineLearningServices/workspaces/
+      hub-chubb-mcp-poc/connections/oai-chubb-connection?api-version=2024-10-01
+
+Request Body:
+  {
+    "properties": {
+      "category": "AzureOpenAI",
+      "target": "https://oai-chubb-mcp-9342.openai.azure.com/",
+      "authType": "AAD",
+      "metadata": {
+        "ApiType": "Azure",
+        "ResourceId": "/subscriptions/{subscriptionId}/resourceGroups/
+            rg-chubb-mcp-poc/providers/Microsoft.CognitiveServices/
+            accounts/oai-chubb-mcp-9342"
+      }
+    }
+  }
+
+Key details:
+  - authType: "AAD" (uses Azure AD / Entra ID authentication, not API keys)
+  - category: "AzureOpenAI" (tells Foundry this is an Azure OpenAI resource)
+  - target: the OpenAI endpoint URL
+
+Result: Connection "oai-chubb-connection" created (HTTP 201).
+
+
+================================================================================
+5. RBAC PERMISSIONS CONFIGURATION
+================================================================================
+
+The Foundry Project's managed identity (Service Principal) needs permissions to
+call the Azure OpenAI resource. Without this, agent creation fails with
+"PermissionDenied" error.
+
+Project Service Principal ID: cbb175cf-7861-4aa6-b235-6398f7ef4da5
+(This is auto-created when the Project is created with SystemAssigned identity)
+
+ROLE ASSIGNMENTS (3 total):
+
+Assignment 1: Cognitive Services OpenAI Contributor -> Service Principal
+  Role Definition ID: 5e0bd9bd-7b93-4f28-af87-19fc36ad61bd
+  Principal ID:       cbb175cf-7861-4aa6-b235-6398f7ef4da5
+  Principal Type:     ServicePrincipal
+  Scope:             /subscriptions/{sub}/resourceGroups/rg-chubb-mcp-poc/
+                     providers/Microsoft.CognitiveServices/accounts/oai-chubb-mcp-9342
+
+Assignment 2: Cognitive Services User -> Service Principal
+  Role Definition ID: a97b65f3-24c7-4388-baec-2e87135dc908
+  Principal ID:       cbb175cf-7861-4aa6-b235-6398f7ef4da5
+  Principal Type:     ServicePrincipal
+  Scope:             (same as above)
+
+Assignment 3: Cognitive Services OpenAI Contributor -> Current User
+  Role Definition ID: 5e0bd9bd-7b93-4f28-af87-19fc36ad61bd
+  Principal ID:       (your user object ID from Microsoft Graph /me endpoint)
+  Principal Type:     User
+  Scope:             (same as above)
+
+API Call (for each assignment):
+  PUT https://management.azure.com/{oaiResourceId}/providers/
+      Microsoft.Authorization/roleAssignments/{newGuid}?api-version=2022-04-01
+
+Request Body:
+  {
+    "properties": {
+      "roleDefinitionId": "{oaiResourceId}/providers/Microsoft.Authorization/
+          roleDefinitions/{roleId}",
+      "principalId": "{principalId}",
+      "principalType": "{ServicePrincipal|User}"
+    }
+  }
+
+IMPORTANT: Wait ~10 seconds after RBAC assignment before creating the agent,
+           as role propagation takes a few seconds.
+
+Commands used to assign roles:
+
+  python -c "
+  from azure.identity import DefaultAzureCredential
+  import requests, uuid
+  cred = DefaultAzureCredential()
+  token = cred.get_token('https://management.azure.com/.default').token
+  h = {'Authorization': f'Bearer {token}', 'Content-Type': 'application/json'}
+
+  oai_id = '/subscriptions/a3223db3-76f2-4a7c-8684-57b835dc77e7/resourceGroups/rg-chubb-mcp-poc/providers/Microsoft.CognitiveServices/accounts/oai-chubb-mcp-9342'
+
+  # Assign Cognitive Services OpenAI Contributor to Service Principal
+  role_id = '5e0bd9bd-7b93-4f28-af87-19fc36ad61bd'
+  url = f'https://management.azure.com{oai_id}/providers/Microsoft.Authorization/roleAssignments/{uuid.uuid4()}?api-version=2022-04-01'
+  body = {'properties': {'roleDefinitionId': f'{oai_id}/providers/Microsoft.Authorization/roleDefinitions/{role_id}', 'principalId': 'cbb175cf-7861-4aa6-b235-6398f7ef4da5', 'principalType': 'ServicePrincipal'}}
+  r = requests.put(url, headers=h, json=body)
+  print(f'OpenAI Contributor: {r.status_code}')
+
+  # Assign Cognitive Services User to Service Principal
+  role_id2 = 'a97b65f3-24c7-4388-baec-2e87135dc908'
+  url2 = f'https://management.azure.com{oai_id}/providers/Microsoft.Authorization/roleAssignments/{uuid.uuid4()}?api-version=2022-04-01'
+  body2 = {'properties': {'roleDefinitionId': f'{oai_id}/providers/Microsoft.Authorization/roleDefinitions/{role_id2}', 'principalId': 'cbb175cf-7861-4aa6-b235-6398f7ef4da5', 'principalType': 'ServicePrincipal'}}
+  r2 = requests.put(url2, headers=h, json=body2)
+  print(f'Cognitive Services User: {r2.status_code}')
+  "
+
+
+================================================================================
+6. OPENAPI SPEC FOR BACKEND
+================================================================================
+
+File: astra_openapi.json
+
+This OpenAPI 3.0 spec defines the Astra backend API that the Foundry Agent's
+OpenAPI tool will call. It was created to describe the existing backend endpoints.
+
+Spec details:
+  Server:  https://app-chubb-backend-poc.azurewebsites.net
+
+  Endpoints:
+    POST /chat         (operationId: askAstra)
+      - Primary endpoint used by the agent
+      - Request:  { "message": string, "user_id": string, "thread_id"?: string }
+      - Response: { "response": string, "thread_id": string, "user_id": string }
+
+    POST /chat/stream  (operationId: askAstraStream)
+      - Streaming SSE variant
+      - Same request schema, returns text/event-stream
+
+    GET /health        (operationId: healthCheck)
+      - Returns { "status": "ok" }
+
+
+================================================================================
+7. FOUNDRY AGENT CREATION (AUTOMATED VIA SCRIPT)
+================================================================================
+
+Script: create_foundry_agent.py
+
+This script uses the Azure AI Agents SDK (azure-ai-agents v1.1.0) to create
+the Foundry Agent with an OpenAPI tool.
+
+Key steps in the script:
+
+  1. Discover the agents endpoint from the project's ARM properties:
+     GET https://management.azure.com/subscriptions/{sub}/resourceGroups/
+         rg-chubb-mcp-poc/providers/Microsoft.MachineLearningServices/
+         workspaces/proj-chubb-mcp-poc?api-version=2024-10-01
+     -> Extract "properties.agentsEndpointUri"
+
+  2. Connect to AgentsClient:
+     from azure.ai.agents import AgentsClient
+     client = AgentsClient(
+         endpoint=agents_endpoint,
+         credential=DefaultAzureCredential(),
+         subscription_id=SUBSCRIPTION_ID,
+         resource_group_name=RESOURCE_GROUP,
+         project_name=PROJECT_NAME,
+     )
+
+  3. Create OpenAPI Tool:
+     from azure.ai.agents.models import OpenApiTool, OpenApiAnonymousAuthDetails
+     openapi_tool = OpenApiTool(
+         name="astra_backend",
+         description="Chubb AI Governance Astra Backend...",
+         spec=openapi_spec,           # loaded from astra_openapi.json
+         auth=OpenApiAnonymousAuthDetails(),
+     )
+
+  4. Create the Agent:
+     agent = client.create_agent(
+         model="gpt-4o",
+         name="astra-chubb-governance-agent",
+         instructions=SYSTEM_INSTRUCTIONS,
+         tools=openapi_tool.definitions,
+     )
+
+  Result:
+    Agent ID:    asst_zVruiGuN2cFY90MKXzZEs4g5
+    Agent Name:  astra-chubb-governance-agent
+    Model:       gpt-4o
+    Tools:       1 OpenAPI tool
+
+How to run:
+  cd chubb-ai-governance-mcp-main
+  python create_foundry_agent.py
+
+System Instructions given to the agent:
+  - Always use the 'askAstra' tool for Chubb AI governance questions
+  - Pass the user's question directly to the tool
+  - Present responses clearly and professionally
+  - Respond naturally to greetings without using tools
+
+
+================================================================================
+8. END-TO-END TESTING (AUTOMATED VIA SCRIPT)
+================================================================================
+
+Script: test_foundry_agent.py
+
+This script tests the agent programmatically using the Azure AI Agents SDK.
+
+Key steps:
+  1. Connect to AgentsClient (same as creation script)
+  2. Verify agent exists via client.get_agent(AGENT_ID)
+  3. Create a thread: client.threads.create()
+  4. Add user message: client.messages.create(thread_id, role=USER, content=query)
+  5. Run agent: client.runs.create_and_process(thread_id, agent_id)
+  6. Get response: client.messages.get_last_message_text_by_role(thread_id, role=AGENT)
+  7. Cleanup: client.threads.delete(thread_id)
+
+How to run:
+  cd chubb-ai-governance-mcp-main
+  python test_foundry_agent.py
+
+Test Result (verified working):
+  Query:    "What is Chubb's AI governance policy?"
+  Status:   COMPLETED
+  Duration: 23.1 seconds
+  Tokens:   1,331 prompt + 247 completion = 1,578 total
+  Response: Detailed answer about Chubb's platform-centric governance framework,
+            secure AI operations, developer enablement, monitoring/telemetry,
+            and scalability.
+
+
+================================================================================
+9. HOW TO DO THE SAME MANUALLY VIA AZURE PORTAL UI
+================================================================================
+
+If you prefer to set this up through the Azure Portal UI instead of scripts,
+follow these steps:
+
+STEP 1: Create AI Foundry Hub
+------------------------------
+  1. Go to https://ai.azure.com
+  2. Click "Create new" > "Hub"
+  3. Fill in:
+     - Name: hub-chubb-mcp-poc
+     - Subscription: Visual Studio Enterprise
+     - Resource Group: rg-chubb-mcp-poc
+     - Location: East US
+  4. Click "Create" and wait for provisioning to complete
+
+STEP 2: Create AI Foundry Project
+-----------------------------------
+  1. In the Hub page, click "New project"
+  2. Fill in:
+     - Name: proj-chubb-mcp-poc
+     - Hub: hub-chubb-mcp-poc (auto-selected)
+  3. Click "Create"
+
+STEP 3: Add Azure OpenAI Connection
+-------------------------------------
+  1. In the Hub, go to "Settings" > "Connected resources"
+  2. Click "+ New connection"
+  3. Select "Azure OpenAI"
+  4. Choose the existing resource: oai-chubb-mcp-9342
+  5. Authentication type: Azure Active Directory (AAD)
+  6. Connection name: oai-chubb-connection
+  7. Click "Add connection"
+
+STEP 4: Assign RBAC Permissions
+---------------------------------
+  1. Go to Azure Portal (https://portal.azure.com)
+  2. Navigate to: Resource Group > rg-chubb-mcp-poc > oai-chubb-mcp-9342
+  3. Click "Access control (IAM)" in the left menu
+  4. Click "+ Add" > "Add role assignment"
+  5. Role: "Cognitive Services OpenAI Contributor"
+     - Members: Search for the Project's managed identity
+       (proj-chubb-mcp-poc, type: Managed Identity)
+     - Click "Review + assign"
+  6. Repeat for role: "Cognitive Services User"
+     - Same member (proj-chubb-mcp-poc managed identity)
+  7. Also assign "Cognitive Services OpenAI Contributor" to your own user
+     account (so you can create agents from CLI/SDK)
+
+STEP 5: Create the Agent
+--------------------------
+  1. Go to https://ai.azure.com
+  2. Open project: proj-chubb-mcp-poc
+  3. Go to "Agents" in the left menu
+  4. Click "+ New agent"
+  5. Configure:
+     - Name: astra-chubb-governance-agent
+     - Model: gpt-4o
+     - Instructions: (paste the system instructions - see Section 7 above)
+  6. Under "Tools", click "+ Add tool"
+  7. Select "OpenAPI"
+  8. Fill in:
+     - Name: astra_backend
+     - Description: Chubb AI Governance Astra Backend
+     - Auth: Anonymous (no auth)
+     - OpenAPI spec: Upload or paste the contents of astra_openapi.json
+       (see Section 6 for the full spec)
+  9. Click "Save"
+
+STEP 6: Test in Playground
+----------------------------
+  1. In the Agent page, click "Playground" (or the chat icon)
+  2. Type: "What is Chubb's AI governance policy?"
+  3. The agent should:
+     a. Recognize this is a governance question
+     b. Call the askAstra OpenAPI tool
+     c. The tool calls https://app-chubb-backend-poc.azurewebsites.net/chat
+     d. The backend processes through Supervisor > Domain Agent > MCP > AI Search
+     e. The agent presents the response
+
+
+================================================================================
+10. ARCHITECTURE DIAGRAM
+================================================================================
+
+  +-------------------+
+  |  Azure AI Foundry  |
+  |    Playground UI   |
+  +--------+----------+
+           |
+           v
+  +--------+----------+
+  |  Foundry Agent     |
+  |  (gpt-4o)          |
+  |  astra-chubb-      |
+  |  governance-agent   |
+  +--------+----------+
+           |
+           | OpenAPI Tool (askAstra)
+           | POST /chat
+           v
+  +--------+----------+
+  |  App Service        |
+  |  app-chubb-backend  |
+  |  -poc               |
+  |  (FastAPI+LangGraph)|
+  +--------+----------+
+           |
+           v
+  +--------+----------+
+  |  Supervisor Agent   |
+  |  (LangGraph)        |
+  +--------+----------+
+           |
+           v
+  +--------+----------+
+  |  Domain Agent       |
+  |  (ReAct Agent)      |
+  +--------+----------+
+           |
+           | MCP Protocol
+           v
+  +--------+----------+
+  |  MCP Server         |
+  |  app-chubb-mcp-poc  |
+  |  (FastMCP)          |
+  +--------+----------+
+           |
+           | domain_search tool
+           v
+  +--------+----------+
+  |  Azure AI Search    |
+  |  srch-chubb-mcp-    |
+  |  9342               |
+  |  (Chubb governance  |
+  |   knowledge base)   |
+  +-------------------+
+
+
+================================================================================
+11. RESOURCE REFERENCE
+================================================================================
+
+  Resource                 Name                          Type
+  ----------------------   ----------------------------  -------------------------
+  Subscription             Visual Studio Enterprise      a3223db3-76f2-...
+  Resource Group           rg-chubb-mcp-poc              Microsoft.Resources
+  AI Foundry Hub           hub-chubb-mcp-poc             ML Workspace (Hub)
+  AI Foundry Project       proj-chubb-mcp-poc            ML Workspace (Project)
+  OpenAI Connection        oai-chubb-connection          Hub Connection
+  Azure OpenAI             oai-chubb-mcp-9342            Cognitive Services
+  Backend App Service      app-chubb-backend-poc         App Service
+  MCP App Service          app-chubb-mcp-poc             App Service
+  AI Search                srch-chubb-mcp-9342           Search Service
+  Cosmos DB                cosmos-chubb-mcp-poc          DocumentDB
+  Key Vault                kv-chubb-mcp-9342             Key Vault
+  App Insights             appi-chubb-mcp-poc            Application Insights
+
+  Agent Details:
+    Agent ID:    asst_zVruiGuN2cFY90MKXzZEs4g5
+    Agent Name:  astra-chubb-governance-agent
+    Model:       gpt-4o (2024-08-06, 30K TPM, 300 RPM)
+    Tools:       1 OpenAPI tool (askAstra -> /chat endpoint)
+
+  Scripts:
+    create_foundry_hub_project.py  - Creates Hub + Project + OpenAI Connection
+    create_foundry_agent.py        - Creates the Foundry Agent with OpenAPI tool
+    test_foundry_agent.py          - Tests the agent end-to-end from script
+    astra_openapi.json             - OpenAPI 3.0 spec for the Astra backend
+
+================================================================================
+  END OF DOCUMENT
+================================================================================

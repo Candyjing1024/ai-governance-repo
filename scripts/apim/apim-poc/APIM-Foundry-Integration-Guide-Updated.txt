@@ -1,0 +1,678 @@
+Azure AI Foundry + API Management (APIM) — Integration Guide
+================================================================
+
+Overview
+--------
+
+This guide walks through setting up Azure API Management as a secure gateway in front of Azure AI Foundry. The end result is a token-based access model where downstream applications authenticate using a Service Principal, obtain a JWT token through APIM, and use that token to call the LLM. Without a valid token, the LLM endpoint returns 401 Unauthorized.
+
+The architecture looks like this:
+
+    Application (Service Principal)
+           |
+           | 1. POST /auth/token (client credentials)
+           v
+    +-------------------+
+    |   Azure APIM      |  <-- Consumption tier (free for first 1M calls/month)
+    |                   |
+    |  /auth/token      |  --> proxies to Azure AD, returns JWT
+    |  /openai/...      |  --> validates JWT, injects Foundry API key, proxies to Foundry
+    +-------------------+
+           |
+           | 2. POST /openai/deployments/gpt-4.1/chat/completions
+           |    + Authorization: Bearer <jwt>
+           v
+    +-------------------+
+    | Azure AI Foundry  |  <-- gpt-4.1 (or any deployed model)
+    | (foundry-test-0020)|
+    +-------------------+
+
+What you need before starting:
+  - An Azure subscription with permissions to create resources
+  - Azure AD admin access to create App Registrations
+
+
+Step 1: Create an Azure AI Foundry Resource with Default Project
+----------------------------------------------------------------
+
+We start by creating the Foundry resource that hosts our LLM. This is where the model lives.
+
+1. Open the Azure Portal (portal.azure.com)
+2. Search for "Azure AI Foundry" in the top search bar
+3. Click "Create"
+4. Fill in the basics:
+     - Subscription: select your subscription
+     - Resource group: create new or pick an existing one (we used "rg-chubb-mcp-poc")
+     - Region: East US (or your preferred region)
+     - Name: pick a unique name (we used "foundry-test-0020")
+5. On the next screen, leave "Create a default project" checked
+6. Review and Create
+
+Once provisioned, navigate to the resource. You will see three tabs under Keys and Endpoint:
+  - Foundry
+  - OpenAI
+  - AI Services
+
+Go to the "OpenAI" tab and note down:
+  - Endpoint: something like https://foundry-test-0020.openai.azure.com/
+  - KEY 1: your API key (keep this safe, we will store it securely in APIM later)
+
+
+Step 2: Deploy a Model (gpt-4.1)
+---------------------------------
+
+Now we need to deploy a model on the Foundry resource so there is something for APIM to call.
+
+1. From the Foundry resource page, click "Model deployments" in the left menu
+   (or open the Azure AI Foundry portal at ai.azure.com)
+2. Click "Deploy model" > "Deploy base model"
+3. Select "gpt-4.1" (or gpt-4o, or whichever model is available in your region)
+4. Give it a deployment name — we will use "gpt-4.1" as the deployment name
+5. Set the capacity (tokens per minute) based on your needs
+6. Click "Deploy"
+
+Wait for the deployment status to show "Succeeded". You can verify it works by clicking "Open in playground" and sending a test message.
+
+
+Step 3: Create a Service Principal
+------------------------------------
+
+We need a Service Principal (SP) so that applications can authenticate without any human sign-in. The SP gets two roles:
+
+  - Contributor on the resource group (so it can manage APIM)
+  - Cognitive Services OpenAI User on the Foundry resource (so it can call the LLM)
+
+Below is a PowerShell script that does this. An Azure AD admin runs it once — it uses a device-code flow for the initial sign-in, then creates everything via REST API.
+
+Save this as "Create-ServicePrincipal.ps1" and run it:
+
+--- START OF SCRIPT ---
+
+# Configuration - update these for your environment
+$TenantId       = "<YOUR_TENANT_ID>"           # Azure AD > Overview > Tenant ID
+$SubscriptionId = "<YOUR_SUBSCRIPTION_ID>"
+$ResourceGroup  = "<YOUR_RESOURCE_GROUP>"       # e.g. rg-chubb-mcp-poc
+$FoundryAccount = "<YOUR_FOUNDRY_RESOURCE>"     # e.g. foundry-test-0020
+
+# Well-known Azure PowerShell client ID (public, used for device-code flow)
+$publicClientId = "1950a258-227b-4e31-a9cf-717495945fc2"
+
+Write-Host ""
+Write-Host "=== Create Service Principal ===" -ForegroundColor Yellow
+Write-Host ""
+
+# --- 1. Device-code sign-in (one time only) ---
+Write-Host "[1/6] Starting device-code sign-in..." -ForegroundColor Cyan
+$dcBody = @{
+    client_id = $publicClientId
+    scope     = "https://graph.microsoft.com/.default offline_access"
+}
+$dcResponse = Invoke-RestMethod -Method POST `
+    -Uri "https://login.microsoftonline.com/$TenantId/oauth2/v2.0/devicecode" `
+    -Body $dcBody -ContentType "application/x-www-form-urlencoded"
+
+Write-Host "  Open browser to:  $($dcResponse.verification_uri)" -ForegroundColor Green
+Write-Host "  Enter this code:  $($dcResponse.user_code)" -ForegroundColor Green
+Write-Host "  Waiting for sign-in..." -ForegroundColor Gray
+
+$graphToken = $null
+$refreshToken = $null
+$elapsed = 0
+
+while ($elapsed -lt $dcResponse.expires_in) {
+    Start-Sleep -Seconds $dcResponse.interval
+    $elapsed += $dcResponse.interval
+    try {
+        $tokenBody = @{
+            grant_type  = "urn:ietf:params:oauth:grant-type:device_code"
+            client_id   = $publicClientId
+            device_code = $dcResponse.device_code
+        }
+        $tr = Invoke-RestMethod -Method POST `
+            -Uri "https://login.microsoftonline.com/$TenantId/oauth2/v2.0/token" `
+            -Body $tokenBody -ContentType "application/x-www-form-urlencoded"
+        $graphToken = $tr.access_token
+        $refreshToken = $tr.refresh_token
+        Write-Host "  Signed in." -ForegroundColor Green
+        break
+    }
+    catch {
+        $err = $null
+        try { $err = $_.ErrorDetails.Message | ConvertFrom-Json } catch {}
+        if ($err.error -eq "authorization_pending") { continue }
+        if ($err.error -eq "expired_token") {
+            Write-Host "  Code expired. Run the script again." -ForegroundColor Red; exit 1
+        }
+        continue
+    }
+}
+
+if (-not $graphToken) { Write-Host "  Could not sign in." -ForegroundColor Red; exit 1 }
+
+$graphHeaders = @{ "Authorization" = "Bearer $graphToken"; "Content-Type" = "application/json" }
+
+# --- 2. Exchange refresh token for ARM token ---
+Write-Host "[2/6] Getting ARM token..." -ForegroundColor Cyan
+$armTr = Invoke-RestMethod -Method POST `
+    -Uri "https://login.microsoftonline.com/$TenantId/oauth2/v2.0/token" `
+    -Body @{
+        grant_type    = "refresh_token"
+        client_id     = $publicClientId
+        refresh_token = $refreshToken
+        scope         = "https://management.azure.com/.default"
+    } -ContentType "application/x-www-form-urlencoded"
+
+$armHeaders = @{ "Authorization" = "Bearer $($armTr.access_token)"; "Content-Type" = "application/json" }
+Write-Host "  Done." -ForegroundColor Green
+
+# --- 3. Create App Registration ---
+Write-Host "[3/6] Creating App Registration..." -ForegroundColor Cyan
+$app = Invoke-RestMethod -Method POST `
+    -Uri "https://graph.microsoft.com/v1.0/applications" `
+    -Headers $graphHeaders `
+    -Body (@{ displayName = "sp-apim-foundry-poc"; signInAudience = "AzureADMyOrg" } | ConvertTo-Json)
+
+$appObjectId = $app.id
+$appClientId = $app.appId
+Write-Host "  App created. Client ID: $appClientId" -ForegroundColor Green
+
+# --- 4. Create client secret ---
+Write-Host "[4/6] Creating client secret (12-month expiry)..." -ForegroundColor Cyan
+$secret = Invoke-RestMethod -Method POST `
+    -Uri "https://graph.microsoft.com/v1.0/applications/$appObjectId/addPassword" `
+    -Headers $graphHeaders `
+    -Body (@{
+        passwordCredential = @{
+            displayName = "apim-poc-key"
+            endDateTime = (Get-Date).AddMonths(12).ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ")
+        }
+    } | ConvertTo-Json -Depth 3)
+
+$clientSecret = $secret.secretText
+Write-Host "  Secret created (copy it now, shown only once)." -ForegroundColor Yellow
+
+# --- 5. Create Service Principal ---
+Write-Host "[5/6] Creating Service Principal..." -ForegroundColor Cyan
+$sp = Invoke-RestMethod -Method POST `
+    -Uri "https://graph.microsoft.com/v1.0/servicePrincipals" `
+    -Headers $graphHeaders `
+    -Body (@{ appId = $appClientId } | ConvertTo-Json)
+
+$spObjectId = $sp.id
+Write-Host "  SP created. Object ID: $spObjectId" -ForegroundColor Green
+
+# --- 6. Assign RBAC roles ---
+Write-Host "[6/6] Assigning roles..." -ForegroundColor Cyan
+
+$ARM = "https://management.azure.com"
+$rgScope = "/subscriptions/$SubscriptionId/resourceGroups/$ResourceGroup"
+$foundryScope = "$rgScope/providers/Microsoft.CognitiveServices/accounts/$FoundryAccount"
+
+$roles = @(
+    @{ Name = "Contributor"; Id = "b24988ac-6180-42a0-ab88-20f7382dd24c"; Scope = $rgScope },
+    @{ Name = "Cognitive Services OpenAI User"; Id = "5e0bd9bd-7b93-4f28-af87-19fc36ad61bd"; Scope = $foundryScope }
+)
+
+foreach ($role in $roles) {
+    $assignUrl = "$ARM$($role.Scope)/providers/Microsoft.Authorization/roleAssignments/$([guid]::NewGuid())?api-version=2022-04-01"
+    $assignBody = @{
+        properties = @{
+            roleDefinitionId = "$($role.Scope)/providers/Microsoft.Authorization/roleDefinitions/$($role.Id)"
+            principalId      = $spObjectId
+            principalType    = "ServicePrincipal"
+        }
+    } | ConvertTo-Json -Depth 4
+
+    try {
+        Invoke-RestMethod -Method PUT -Uri $assignUrl -Headers $armHeaders -Body $assignBody | Out-Null
+        Write-Host "  + $($role.Name)" -ForegroundColor Green
+    }
+    catch {
+        $errBody = $null
+        try { $errBody = $_.ErrorDetails.Message | ConvertFrom-Json } catch {}
+        if ($errBody.error.code -eq "RoleAssignmentExists") {
+            Write-Host "  ~ $($role.Name) (already assigned)" -ForegroundColor Gray
+        } else {
+            Write-Host "  ! $($role.Name) failed: $($_.Exception.Message)" -ForegroundColor Red
+        }
+    }
+}
+
+# --- Done ---
+Write-Host ""
+Write-Host "=== SERVICE PRINCIPAL READY ===" -ForegroundColor Green
+Write-Host ""
+Write-Host "  Save these values — you will need them for APIM setup:" -ForegroundColor White
+Write-Host ""
+Write-Host "  Tenant ID       : $TenantId"
+Write-Host "  Client ID       : $appClientId"
+Write-Host "  Client Secret   : $clientSecret"
+Write-Host ""
+
+--- END OF SCRIPT ---
+
+After running the script, save the Tenant ID, Client ID, and Client Secret somewhere secure. You will use these in Step 5.
+
+
+Step 4: Create Azure API Management (Consumption Tier)
+-------------------------------------------------------
+
+APIM acts as the gateway that sits in front of Foundry. We use the Consumption tier because it has no upfront cost — the first 1 million calls per month are free.
+
+1. Open the Azure Portal
+2. Search for "API Management services"
+3. Click "Create"
+4. Fill in:
+     - Subscription: your subscription
+     - Resource group: same as before (rg-chubb-mcp-poc)
+     - Region: East US
+     - Resource name: pick a globally unique name (we used "apim-chubb-mcp-poc")
+     - Organization name: your team name
+     - Administrator email: your admin email
+5. Pricing tier: select "Consumption"
+6. Click Review + Create > Create
+
+Consumption tier provisions in about 1-5 minutes. Once done, note down:
+  - Gateway URL: https://<your-apim-name>.azure-api.net
+
+
+Step 5: Configure APIs in APIM
+-------------------------------
+
+Now we set up two APIs in APIM. The first one generates tokens. The second one calls the LLM and is locked behind JWT validation.
+
+
+5A. Store the Foundry API Key as a Named Value
+...............................................
+
+We do not want callers to ever see the Foundry API key. We store it in APIM as a secret.
+
+1. In APIM, left menu > Named values > + Add
+2. Fill in:
+     - Name: foundry-api-key
+     - Display name: foundry-api-key
+     - Type: Secret
+     - Value: paste KEY 1 from Foundry (Step 1)
+3. Click Save
+
+
+5B. Create the Token Generation API (POST /auth/token)
+......................................................
+
+This API lets callers exchange their Service Principal credentials for a JWT.
+
+1. In APIM, left menu > APIs > + Add API > HTTP (Manually define)
+2. Fill in:
+     - Display name: Auth - Token Generation
+     - Name: auth-api
+     - Web service URL: https://login.microsoftonline.com
+     - API URL suffix: auth
+     - Subscription required: UNCHECK THIS
+3. Click Create
+4. Click + Add operation:
+     - Display name: Get Access Token
+     - Method: POST
+     - URL: /token
+5. Click Save
+6. Click "All operations" > Inbound processing > </> (code editor)
+7. Replace the entire policy with:
+
+<policies>
+    <inbound>
+        <base />
+        <set-backend-service base-url="https://login.microsoftonline.com/<YOUR_TENANT_ID>/oauth2/v2.0" />
+        <rewrite-uri template="/token" copy-unmatched-params="true" />
+    </inbound>
+    <backend>
+        <base />
+    </backend>
+    <outbound>
+        <base />
+    </outbound>
+    <on-error>
+        <base />
+    </on-error>
+</policies>
+
+(Replace <YOUR_TENANT_ID> with your actual tenant ID)
+
+8. Click Save
+
+
+5C. Create the LLM API with JWT Protection (POST /openai/...)
+..............................................................
+
+This is the actual LLM endpoint. It is locked — without a valid Bearer token, it returns 401.
+
+1. In APIM, left menu > APIs > + Add API > HTTP
+2. Fill in:
+     - Display name: Azure OpenAI - Token Protected
+     - Name: azure-openai
+     - Web service URL: https://<your-foundry>.openai.azure.com/openai
+       (e.g. https://foundry-test-0020.openai.azure.com/openai)
+     - API URL suffix: openai
+     - Subscription required: UNCHECK THIS
+3. Click Create
+4. Click + Add operation:
+     - Display name: Chat Completions
+     - Method: POST
+     - URL: /deployments/gpt-4.1/chat/completions
+       (replace gpt-4.1 with your deployment name from Step 2)
+     - Under Query tab, add parameter:
+         Name: api-version
+         Default value: 2024-12-01-preview
+         Required: Yes
+5. Click Save
+6. Click "All operations" > Inbound processing > </> (code editor)
+7. Replace the entire policy with:
+
+<policies>
+    <inbound>
+        <base />
+        <validate-jwt header-name="Authorization"
+                      failed-validation-httpcode="401"
+                      failed-validation-error-message="Access denied. Provide a valid Bearer token from POST /auth/token.">
+            <openid-config url="https://login.microsoftonline.com/<YOUR_TENANT_ID>/v2.0/.well-known/openid-configuration" />
+            <audiences>
+                <audience>https://cognitiveservices.azure.com</audience>
+            </audiences>
+            <issuers>
+                <issuer>https://sts.windows.net/<YOUR_TENANT_ID>/</issuer>
+            </issuers>
+        </validate-jwt>
+        <set-header name="Authorization" exists-action="delete" />
+        <set-header name="api-key" exists-action="override">
+            <value>{{foundry-api-key}}</value>
+        </set-header>
+        <set-backend-service base-url="https://<your-foundry>.openai.azure.com/openai" />
+    </inbound>
+    <backend>
+        <base />
+    </backend>
+    <outbound>
+        <base />
+    </outbound>
+    <on-error>
+        <base />
+    </on-error>
+</policies>
+
+(Replace <YOUR_TENANT_ID> and <your-foundry> with your actual values)
+
+8. Click Save
+
+What this policy does:
+  - validate-jwt: checks the Authorization header for a valid Azure AD JWT.
+    If missing or invalid, returns 401.
+  - set-header Authorization delete: strips the caller's Bearer token.
+  - set-header api-key: injects the real Foundry API key from the Named Value.
+  - set-backend-service: routes the request to Foundry.
+
+The caller never sees the Foundry API key. APIM handles it server-side.
+
+
+Step 6: Testing the Full Flow
+------------------------------
+
+Now we test the three-step flow: prove the LLM is locked, get a token, then call the LLM.
+
+You can use PowerShell, curl, Postman, or any REST client (like Thunder Client in VS Code).
+
+Below are the requests using curl syntax.
+
+
+Test 1: Call LLM without a token (expect 401)
+
+    POST https://<your-apim>.azure-api.net/openai/deployments/gpt-4.1/chat/completions?api-version=2024-12-01-preview
+    Content-Type: application/json
+
+    {
+      "messages": [{"role": "user", "content": "Hello"}],
+      "max_tokens": 50
+    }
+
+    Expected response: HTTP 401
+    { "statusCode": 401, "message": "Access denied. Provide a valid Bearer token from POST /auth/token." }
+
+    This confirms the LLM is not accessible without authentication.
+
+
+Test 2: Get a JWT token via APIM
+
+    POST https://<your-apim>.azure-api.net/auth/token
+    Content-Type: application/x-www-form-urlencoded
+
+    grant_type=client_credentials
+    &client_id=<SP_CLIENT_ID>
+    &client_secret=<SP_CLIENT_SECRET>
+    &scope=https://cognitiveservices.azure.com/.default
+
+    Expected response: HTTP 200
+    {
+      "token_type": "Bearer",
+      "expires_in": 3599,
+      "access_token": "eyJ0eXAiOiJKV1QiLCJhbGciOi..."
+    }
+
+    Copy the access_token value.
+
+
+Test 3: Call LLM with the token (expect 200)
+
+    POST https://<your-apim>.azure-api.net/openai/deployments/gpt-4.1/chat/completions?api-version=2024-12-01-preview
+    Content-Type: application/json
+    Authorization: Bearer <paste access_token from Test 2>
+
+    {
+      "messages": [{"role": "user", "content": "What is Azure API Management?"}],
+      "max_tokens": 100
+    }
+
+    Expected response: HTTP 200
+    {
+      "choices": [
+        {
+          "message": {
+            "role": "assistant",
+            "content": "Azure API Management is a hybrid, multi-cloud management platform..."
+          }
+        }
+      ]
+    }
+
+    This confirms the full flow:
+    Service Principal credentials -> JWT token -> APIM validates token -> Foundry responds.
+
+
+Summary
+-------
+
+What we built:
+  1. Azure AI Foundry resource with a gpt-4.1 deployment
+  2. A Service Principal that applications use to authenticate (no human sign-in)
+  3. Azure API Management (Consumption tier, free for POC) as the gateway
+  4. Two APIs in APIM:
+     - /auth/token — generates JWT tokens via Azure AD
+     - /openai/... — calls the LLM, protected by JWT validation
+
+Security guarantees:
+  - The LLM endpoint is not accessible without a valid token
+  - Tokens are only issued to registered Service Principals with valid credentials
+  - The Foundry API key is never exposed to callers (stored as a Named Value in APIM)
+  - All traffic flows through APIM, which provides audit logging, throttling, and monitoring
+
+To replicate this setup in another environment:
+  1. Create a Foundry resource and deploy a model
+  2. Run the Service Principal script (Step 3) with your tenant/subscription/resource values
+  3. Create APIM (Consumption tier) from the portal
+  4. Follow Step 5 to configure the APIs and policies
+  5. Test using Step 6
+
+
+================================================================================
+APPENDIX: Configuring the Foundry URL (services.ai.azure.com) in APIM
+================================================================================
+
+Background
+----------
+
+When you create an Azure AI Foundry resource, you get three different endpoint URLs
+under Keys and Endpoint. All three point to the same underlying resource:
+
+  1. OpenAI URL      : https://<your-foundry>.openai.azure.com/
+  2. Foundry URL     : https://<your-foundry>.services.ai.azure.com/
+  3. AI Services URL : https://<your-foundry>.cognitiveservices.azure.com/
+
+In Step 5C above, we configured APIM to use the OpenAI URL as the backend. This
+appendix shows how to register the Foundry URL as an additional API in APIM, so
+callers can access the LLM through the newer unified Foundry endpoint as well.
+
+Key point: the same JWT token, the same API key, and the same RBAC role
+(Cognitive Services OpenAI User) work across all three URLs. Nothing changes
+on the authentication side — only the backend hostname is different.
+
+
+Step A1: Store the Foundry API Key (skip if already done)
+---------------------------------------------------------
+
+If you already created the Named Value "foundry-api-key" in Step 5A, skip this.
+The same key works for both the OpenAI URL and the Foundry URL.
+
+
+Step A2: Create the Foundry LLM API with JWT Protection
+---------------------------------------------------------
+
+1. In the Azure Portal, open your APIM instance
+2. Left menu > APIs > click "+ Add API" > select "HTTP" (Manually define an HTTP API)
+3. Fill in:
+     - Display name       : Azure AI Foundry - Token Protected
+     - Name               : azure-foundry
+     - Web service URL    : https://<your-foundry>.services.ai.azure.com/openai
+     - API URL suffix     : foundry
+     - Subscription required : UNCHECK THIS (important)
+4. Click Create
+
+5. Click "+ Add operation" and fill in:
+     - Display name : Chat Completions
+     - Method       : POST
+     - URL          : /deployments/gpt-4.1/chat/completions
+       (replace gpt-4.1 with your deployment name if different)
+
+6. Go to the Query tab, click "+ Add parameter":
+     - Name          : api-version
+     - Default value : 2024-12-01-preview
+     - Required      : Yes
+
+7. Click Save
+
+
+Step A3: Add the JWT Validation + API Key Injection Policy
+-----------------------------------------------------------
+
+1. In the API you just created, click "All operations" on the left
+2. In Inbound processing, click the </> (code editor) icon
+3. Replace the entire policy with:
+
+<policies>
+    <inbound>
+        <base />
+        <validate-jwt header-name="Authorization"
+                      failed-validation-httpcode="401"
+                      failed-validation-error-message="Access denied. Provide a valid Bearer token.">
+            <openid-config url="https://login.microsoftonline.com/<YOUR_TENANT_ID>/v2.0/.well-known/openid-configuration" />
+            <audiences>
+                <audience>https://cognitiveservices.azure.com</audience>
+            </audiences>
+            <issuers>
+                <issuer>https://sts.windows.net/<YOUR_TENANT_ID>/</issuer>
+            </issuers>
+        </validate-jwt>
+        <set-header name="Authorization" exists-action="delete" />
+        <set-header name="api-key" exists-action="override">
+            <value>{{foundry-api-key}}</value>
+        </set-header>
+        <set-backend-service base-url="https://<your-foundry>.services.ai.azure.com/openai" />
+    </inbound>
+    <backend>
+        <base />
+    </backend>
+    <outbound>
+        <base />
+    </outbound>
+    <on-error>
+        <base />
+    </on-error>
+</policies>
+
+(Replace <YOUR_TENANT_ID> with your Azure AD tenant ID, and <your-foundry> with
+your Foundry resource name, e.g. foundry-test-0020)
+
+4. Click Save
+
+This policy is identical to the one used for the OpenAI URL in Step 5C, except
+the backend URL points to services.ai.azure.com instead of openai.azure.com.
+
+
+Step A4: Testing the Foundry URL API
+--------------------------------------
+
+The token you already have from Step 6 / Test 2 works here — no need to generate
+a new one. The only difference is the URL path uses /foundry/ instead of /openai/.
+
+
+Test A1: Call Foundry API without a token (expect 401)
+
+    POST https://<your-apim>.azure-api.net/foundry/deployments/gpt-4.1/chat/completions?api-version=2024-12-01-preview
+    Content-Type: application/json
+
+    {
+      "messages": [{"role": "user", "content": "Hello"}],
+      "max_tokens": 50
+    }
+
+    Expected response: HTTP 401
+    { "statusCode": 401, "message": "Access denied. Provide a valid Bearer token." }
+
+
+Test A2: Call Foundry API with the token (expect 200)
+
+    POST https://<your-apim>.azure-api.net/foundry/deployments/gpt-4.1/chat/completions?api-version=2024-12-01-preview
+    Content-Type: application/json
+    Authorization: Bearer <paste access_token from Test 2 in Step 6>
+
+    {
+      "messages": [{"role": "user", "content": "Hello from Foundry URL!"}],
+      "max_tokens": 50
+    }
+
+    Expected response: HTTP 200
+    {
+      "choices": [
+        {
+          "message": {
+            "role": "assistant",
+            "content": "Hello! How can I help you today?"
+          }
+        }
+      ]
+    }
+
+
+Comparison: OpenAI URL vs Foundry URL
+--------------------------------------
+
+  +-------------------------+-------------------------------------------+-------------------------------------------+
+  |                         | OpenAI URL (Step 5C)                      | Foundry URL (Appendix)                    |
+  +-------------------------+-------------------------------------------+-------------------------------------------+
+  | Backend hostname        | <your-foundry>.openai.azure.com           | <your-foundry>.services.ai.azure.com      |
+  | APIM API suffix         | /openai                                   | /foundry                                  |
+  | Same API key?           | Yes                                       | Yes                                       |
+  | Same Bearer token?      | Yes                                       | Yes                                       |
+  | Same JWT policy?        | Yes                                       | Yes                                       |
+  | Same RBAC role?         | Yes (Cognitive Services OpenAI User)      | Yes (Cognitive Services OpenAI User)      |
+  | Chat completions path   | /openai/deployments/gpt-4.1/chat/...      | /foundry/deployments/gpt-4.1/chat/...     |
+  +-------------------------+-------------------------------------------+-------------------------------------------+
+
+Both APIs can live side by side in APIM. Callers use the same token for either endpoint.
+The Foundry URL (services.ai.azure.com) is the newer unified endpoint that Microsoft
+is moving towards, while the OpenAI URL (openai.azure.com) remains fully supported.
