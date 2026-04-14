@@ -9,6 +9,7 @@ scripts/
 ├── foundry-new-rest-api/      # NEW Foundry (CognitiveServices) CRUD operations
 ├── foundry-old-rest-api/       # OLD Foundry (MachineLearningServices) operations
 ├── apim/                       # Azure API Management integration
+├── azure-policy/               # Azure Policy for AI model governance
 └── documentation/              # Guides and validation reports
 ```
 
@@ -98,6 +99,18 @@ PowerShell scripts for APIM as AI Gateway with Foundry integration and semantic 
 - APIM-Foundry-Integration-Guide-Updated.txt
 - APIM-Semantic-Cache-POC-End-to-End.txt
 - APIM-Product-Based-Access-Control-Guide.txt
+
+### [azure-policy/](azure-policy/)
+**Azure Policy for AI Model Governance**
+
+POC for controlling which AI models can be deployed in Foundry using Azure Policy built-in definitions.
+
+**Key Scripts:**
+- `01-Deploy-Model-Policy-POC.ps1` - Full POC (PowerShell/Azure CLI)
+- `02-Validate-Model-Policy.py` - Full POC (Python/ARM REST API)
+- `policy-params.json` - Approved model list configuration
+
+**Features:** Policy assignment, deployment testing, compliance monitoring, cleanup
 
 ### [documentation/](documentation/)
 **Documentation Files**

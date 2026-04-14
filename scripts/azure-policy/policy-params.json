@@ -1,0 +1,14 @@
+{
+    "effect": {
+        "value": "Deny"
+    },
+    "allowedPublishers": {
+        "value": []
+    },
+    "allowedAssetIds": {
+        "value": [
+            "azureml://registries/azure-openai/models/gpt-4o/versions/2024-11-20",
+            "azureml://registries/azure-openai/models/gpt-4o-mini/versions/2024-07-18"
+        ]
+    }
+}
