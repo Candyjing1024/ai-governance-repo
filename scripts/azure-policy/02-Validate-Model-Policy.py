@@ -41,13 +41,15 @@ POLICY_DISPLAY_NAME    = "Limit Foundry Model Deployments - POC"
 # rely on allowedAssetIds for fine-grained control.
 ALLOWED_PUBLISHERS = []
 ALLOWED_ASSET_IDS  = [
-    "azureml://registries/azure-openai/models/gpt-4o/versions/2024-11-20",
+    "azureml://registries/azure-openai/models/gpt-4.1/versions/2025-04-14",
     "azureml://registries/azure-openai/models/gpt-4o-mini/versions/2024-07-18",
 ]
 
-# Test models
-ALLOWED_MODEL   = {"name": "gpt-4o",       "version": "2024-11-20"}
-BLOCKED_MODEL   = {"name": "gpt-35-turbo", "version": "0125"}
+# Test models — must match what's validated:
+#   Allowed: gpt-4.1 (in allowedAssetIds) → HTTP 201
+#   Blocked: gpt-4o  (NOT in allowedAssetIds) → HTTP 400 NonCompliant
+ALLOWED_MODEL   = {"name": "gpt-4.1",  "version": "2025-04-14"}
+BLOCKED_MODEL   = {"name": "gpt-4o",   "version": "2024-11-20"}
 
 # API versions
 API_POLICY  = "2023-04-01"
@@ -211,10 +213,14 @@ def test_blocked_deployment():
 
     r = requests.put(url, headers=headers, json=body)
 
-    if r.status_code == 403 or "RequestDisallowedByPolicy" in r.text or "PolicyViolation" in r.text:
+    # Azure returns HTTP 400 with "NonCompliant" for CognitiveServices data-plane policy violations
+    # (not HTTP 403 / "RequestDisallowedByPolicy" as with standard ARM policies)
+    if (r.status_code in (400, 403)
+            or "NonCompliant" in r.text
+            or "RequestDisallowedByPolicy" in r.text
+            or "PolicyViolation" in r.text):
         print(f"  PASS: Deployment correctly BLOCKED by policy!")
         print(f"  HTTP {r.status_code}")
-        # Extract policy error
         try:
             err = r.json().get("error", {})
             print(f"  Code: {err.get('code', 'N/A')}")
@@ -226,14 +232,13 @@ def test_blocked_deployment():
     elif r.status_code in (200, 201, 202):
         print(f"  WARNING: Deployment was NOT blocked! (HTTP {r.status_code})")
         print(f"  Policy may not have propagated. Wait 15 minutes and retry.")
-        # Cleanup
         print(f"  Cleaning up test deployment...")
         requests.delete(url, headers=headers)
         return False
     else:
         print(f"  HTTP {r.status_code}")
         print(f"  Response: {r.text[:500]}")
-        if "disallowed by policy" in r.text.lower():
+        if "noncompliant" in r.text.lower() or "disallowed by policy" in r.text.lower():
             print(f"\n  PASS: Policy blocked the deployment!")
             return True
         print(f"\n  INCONCLUSIVE: Check response above.")

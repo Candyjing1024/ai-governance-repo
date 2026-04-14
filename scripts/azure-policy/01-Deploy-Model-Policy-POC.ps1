@@ -33,11 +33,13 @@ $ParamsFile       = "$PSScriptRoot\policy-params.json"
 $PolicyAssignmentName = "limit-foundry-model-deployments"
 $PolicyDisplayName    = "Limit Foundry Model Deployments - POC"
 
-# Models for testing
-$AllowedModel        = "gpt-4o"
-$AllowedModelVersion = "2024-11-20"
-$BlockedModel        = "gpt-4o-mini"    # Not in allowedAssetIds
-$BlockedModelVersion = "2024-07-18"     # Use a model available in your region
+# Models for testing — must match validated results:
+#   Allowed: gpt-4.1 (in allowedAssetIds) -> HTTP 201
+#   Blocked: gpt-4o  (NOT in allowedAssetIds) -> HTTP 400 NonCompliant
+$AllowedModel        = "gpt-4.1"
+$AllowedModelVersion = "2025-04-14"
+$BlockedModel        = "gpt-4o"
+$BlockedModelVersion = "2024-11-20"
 
 # ============================================================
 # STEP 0: Login and set subscription
@@ -190,7 +192,7 @@ $result = az rest --method PUT `
     --body "@$blockedBodyFile" `
     --output json 2>&1
 
-if ($result -match "RequestDisallowedByPolicy" -or $result -match "PolicyViolation" -or $result -match "disallowed by policy") {
+if ($result -match "NonCompliant" -or $result -match "RequestDisallowedByPolicy" -or $result -match "PolicyViolation" -or $result -match "disallowed by policy") {
     Write-Host "  PASS: Deployment correctly BLOCKED by policy!" -ForegroundColor Green
     Write-Host "  Policy violation detected as expected."
 } elseif ($LASTEXITCODE -ne 0) {
