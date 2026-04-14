@@ -7,8 +7,7 @@
     },
     "allowedAssetIds": {
         "value": [
-            "azureml://registries/azure-openai/models/gpt-4.1/versions/2025-04-14",
-            "azureml://registries/azure-openai/models/gpt-4o-mini/versions/2024-07-18"
+            "azureml://registries/azure-openai/models/gpt-4.1/versions/2025-04-14"
         ]
     }
 }

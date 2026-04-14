@@ -42,7 +42,6 @@ POLICY_DISPLAY_NAME    = "Limit Foundry Model Deployments - POC"
 ALLOWED_PUBLISHERS = []
 ALLOWED_ASSET_IDS  = [
     "azureml://registries/azure-openai/models/gpt-4.1/versions/2025-04-14",
-    "azureml://registries/azure-openai/models/gpt-4o-mini/versions/2024-07-18",
 ]
 
 # Test models — must match what's validated:
