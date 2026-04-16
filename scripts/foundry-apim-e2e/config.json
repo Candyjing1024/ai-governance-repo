@@ -1,0 +1,39 @@
+{
+  "tenant_id": "826cc703-4cf3-4b4f-a37b-b8e8b50fbba6",
+  "subscription_id": "a3223db3-76f2-4a7c-8684-57b835dc77e7",
+  "service_principal": {
+    "name": "sp-foundry-e2e-poc",
+    "client_id": "db149a35-ccd6-41db-b1e6-43487124ac49",
+    "client_secret": "<sp-client-secret>"
+  },
+  "resource_group": "rg-foundry-e2e-poc",
+  "location": "eastus",
+  "foundry": {
+    "account_name": "foundry-e2e-001",
+    "project_name": "proj-e2e-001",
+    "api_version": "2025-12-01",
+    "api_version_preview": "2026-01-15-preview"
+  },
+  "model": {
+    "name": "gpt-4.1",
+    "version": "2025-04-14",
+    "deployment_name": "gpt-41",
+    "sku": "GlobalStandard",
+    "capacity": 1
+  },
+  "agent": {
+    "name": "e2e-agent",
+    "instructions": "You are a helpful assistant for the AI governance POC."
+  },
+  "apim": {
+    "name": "apim-foundry-e2e-002",
+    "sku": "StandardV2",
+    "publisher_email": "admin@contoso.com",
+    "publisher_name": "AI Governance Team",
+    "api_version": "2024-06-01-preview"
+  },
+  "jwt_policy": {
+    "audience": "8652b5ff-388c-41bf-ad48-7dd944aa8087",
+    "allowed_groups": []
+  }
+}
