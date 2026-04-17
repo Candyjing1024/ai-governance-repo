@@ -1,6 +1,6 @@
 {
-  "tenant_id": "<your-tenant-id>",
-  "subscription_id": "<your-subscription-id>",
+  "tenant_id": "<your-entra-tenant-id>",
+  "subscription_id": "<your-azure-subscription-id>",
   "service_principal": {
     "name": "sp-foundry-e2e-poc",
     "client_id": "<auto-filled-by-00>",
@@ -9,7 +9,7 @@
   "resource_group": "rg-foundry-e2e-poc",
   "location": "eastus",
   "foundry": {
-    "account_name": "foundry-e2e-002",
+    "account_name": "foundry-e2e-004",
     "project_name": "proj-e2e-001",
     "api_version": "2025-12-01",
     "api_version_preview": "2026-01-15-preview"
@@ -26,7 +26,7 @@
     "instructions": "You are a helpful assistant for the AI governance POC."
   },
   "apim": {
-    "name": "apim-foundry-e2e-003",
+    "name": "apim-foundry-e2e-005",
     "sku": "StandardV2",
     "publisher_email": "admin@contoso.com",
     "publisher_name": "AI Governance Team",

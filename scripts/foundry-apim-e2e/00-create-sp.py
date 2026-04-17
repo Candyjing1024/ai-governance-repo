@@ -108,6 +108,7 @@ def run():
         "Cognitive Services OpenAI User": "5e0bd9bd-7b93-4f28-af87-19fc36ad61bd",
         "Azure AI Developer": "64702f94-c441-49e6-a78b-ef80e0188fee",
         "API Management Service Contributor": "312a565d-c81f-4fd8-895a-4e21e48d571c",
+        "User Access Administrator": "18d7d88d-d35e-4fb5-a5c3-7773c20a72d9",
     }
 
     for role_name, role_def_id in roles.items():

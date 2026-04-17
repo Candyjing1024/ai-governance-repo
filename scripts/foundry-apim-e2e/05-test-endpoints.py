@@ -12,8 +12,26 @@ sys.path.insert(0, os.path.dirname(__file__))
 from _auth import load_config, arm_headers, ARM, account_id, get_sp_token
 
 
-def get_user_jwt(app_id):
-    """Get a user JWT for the app registration audience via az CLI."""
+def get_user_jwt(app_id, tenant_id):
+    """Get a fresh user JWT with groups claim.
+
+    Clears the token cache and re-authenticates so the JWT
+    includes the latest group memberships from Entra ID.
+    """
+    # Clear cached tokens to force fresh login with groups claim
+    subprocess.run(["az.cmd", "account", "clear"],
+                   capture_output=True, text=True)
+    print("  Token cache cleared, re-authenticating...")
+    r = subprocess.run(
+        ["az.cmd", "login", "--tenant", tenant_id,
+         "--only-show-errors", "-o", "none"],
+        capture_output=False  # allow browser auth to show
+    )
+    if r.returncode != 0:
+        print(f"  ERROR: az login failed (exit {r.returncode})")
+        return None
+    print("  Login complete, acquiring JWT...")
+
     r = subprocess.run(
         ["az.cmd", "account", "get-access-token",
          "--resource", f"api://{app_id}",
@@ -82,7 +100,7 @@ def run():
     print("STEP 1: Acquire user JWT from Entra ID")
     print("=" * 70)
 
-    jwt_token = get_user_jwt(app_id)
+    jwt_token = get_user_jwt(app_id, cfg["tenant_id"])
     if not jwt_token:
         print("\n  Cannot proceed without JWT. Ensure:")
         print(f"    1. App registration {app_id} has identifier URI api://{app_id}")
