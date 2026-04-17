@@ -32,8 +32,8 @@ def decode_jwt_claims(token):
     if len(parts) < 2:
         return {}
     payload = parts[1]
-    payload += "=" * (4 - len(payload) % 4)  # pad base64
-    return json.loads(base64.b64decode(payload))
+    payload += "=" * (-len(payload) % 4)  # pad base64url to multiple of 4
+    return json.loads(base64.urlsafe_b64decode(payload))
 
 
 def test_endpoint(label, method, url, headers, body=None):
