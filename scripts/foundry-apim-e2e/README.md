@@ -111,6 +111,185 @@ python 05-test-endpoints.py   # Acquires user JWT, tests 3 APIM endpoints end-to
 
 **Key**: No API keys or subscription keys are used. User identity is verified via JWT; Foundry auth is handled entirely by APIM's Managed Identity.
 
+## Authentication Flow — Why User JWT Is Required
+
+This POC uses a **user JWT** (not a Service Principal token) to call APIM. This is **required**, not optional, because the security model depends on the `groups` claim that only exists in user tokens.
+
+### The Problem
+
+APIM's inbound policy enforces **group-based access control** — only users who belong to the `sg-foundry-e2e-users` Entra security group can access Foundry through APIM. The `groups` claim in the JWT carries the user's group memberships, and APIM checks it before forwarding the request.
+
+Service Principal tokens **do not contain `groups` claims** because SPs are not members of security groups in the same way users are. If an SP token were used, APIM would reject it with a 401 because the required group claim is missing.
+
+### Sequence Diagram (Text)
+
+```
+ ┌─────────┐     ┌───────────┐     ┌──────────┐     ┌──────────────┐     ┌───────────────┐
+ │  User /  │     │ Azure CLI │     │ Entra ID │     │     APIM     │     │ Azure AI      │
+ │Developer │     │           │     │          │     │              │     │ Foundry       │
+ └────┬─────┘     └─────┬─────┘     └────┬─────┘     └──────┬───────┘     └───────┬───────┘
+      │                 │                │                   │                     │
+      │  STEP 1: Acquire User JWT with Groups Claim         │                     │
+      │─────────────────────────────────────────────────────────────────────────────
+      │                 │                │                   │                     │
+      │ az login        │                │                   │                     │
+      │────────────────>│ login request  │                   │                     │
+      │                 │───────────────>│                   │                     │
+      │                 │  session OK    │                   │                     │
+      │                 │<───────────────│                   │                     │
+      │                 │                │                   │                     │
+      │ az account      │                │                   │                     │
+      │ get-access-token│                │                   │                     │
+      │ --resource      │ token request  │                   │                     │
+      │ api://{app_id}  │ (app audience) │                   │                     │
+      │────────────────>│───────────────>│                   │                     │
+      │                 │                │                   │                     │
+      │                 │   JWT returned │                   │                     │
+      │                 │   aud=api://{app_id}               │                     │
+      │                 │   groups=[{group_id},...]          │                     │
+      │   Bearer token  │<───────────────│                   │                     │
+      │<────────────────│                │                   │                     │
+      │                 │                │                   │                     │
+      │  STEP 2: Call APIM with User JWT │                   │                     │
+      │─────────────────────────────────────────────────────────────────────────────
+      │                 │                │                   │                     │
+      │  GET /foundry/openai/models      │                   │                     │
+      │  Authorization: Bearer {user-jwt}│                   │                     │
+      │─────────────────────────────────────────────────────>│                     │
+      │                 │                │                   │                     │
+      │                 │                │   ┌───────────────┤                     │
+      │                 │                │   │ INBOUND POLICY│                     │
+      │                 │                │   │               │                     │
+      │                 │                │   │ 1. validate-jwt                     │
+      │                 │                │   │    ✓ signature │                     │
+      │                 │                │   │    ✓ audience  │                     │
+      │                 │                │   │    ✓ issuer    │                     │
+      │                 │                │   │               │                     │
+      │                 │                │   │ 2. check groups│                     │
+      │                 │                │   │    ✓ groups    │                     │
+      │                 │                │   │    claim has   │                     │
+      │                 │                │   │    {group_id}  │                     │
+      │                 │                │   └───────────────┤                     │
+      │                 │                │                   │                     │
+      │  STEP 3: Token Swap (MI replaces User JWT)          │                     │
+      │─────────────────────────────────────────────────────────────────────────────
+      │                 │                │                   │                     │
+      │                 │                │   ┌───────────────┤                     │
+      │                 │                │   │ MI TOKEN SWAP │                     │
+      │                 │                │   │               │                     │
+      │                 │                │   │ 3. get MI token│                     │
+      │                 │                │   │    resource=   │                     │
+      │                 │                │   │    cognitive   │                     │
+      │                 │                │   │    services    │                     │
+      │                 │  MI token req  │   │               │                     │
+      │                 │                │<──┤               │                     │
+      │                 │                │──>│ MI token       │                     │
+      │                 │                │   │               │                     │
+      │                 │                │   │ 4. set-header  │                     │
+      │                 │                │   │    Authorization│                    │
+      │                 │                │   │    = Bearer    │                     │
+      │                 │                │   │    {mi-token}  │                     │
+      │                 │                │   └───────────────┤                     │
+      │                 │                │                   │                     │
+      │  STEP 4: Forward to Foundry with MI Auth            │                     │
+      │─────────────────────────────────────────────────────────────────────────────
+      │                 │                │                   │                     │
+      │                 │                │                   │ GET /openai/models   │
+      │                 │                │                   │ Authorization:       │
+      │                 │                │                   │ Bearer {mi-token}    │
+      │                 │                │                   │────────────────────>│
+      │                 │                │                   │                     │
+      │                 │                │                   │  200 OK + models    │
+      │                 │                │                   │<────────────────────│
+      │                 │                │                   │                     │
+      │  200 OK + models list            │                   │                     │
+      │<─────────────────────────────────────────────────────│                     │
+      │                 │                │                   │                     │
+```
+
+### Sequence Diagram (Mermaid)
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant User as 👤 User / Developer
+    participant CLI as Azure CLI
+    participant Entra as Entra ID
+    participant APIM as API Management
+    participant MI as APIM Managed Identity
+    participant Foundry as Azure AI Foundry
+
+    Note over User,Foundry: STEP 1 — Acquire User JWT with Groups Claim
+
+    User->>CLI: az account clear<br/>az login --tenant {tenant_id}
+    CLI->>Entra: Interactive login (browser)
+    Entra-->>CLI: Session established
+    User->>CLI: az account get-access-token<br/>--resource api://{app_id}
+    CLI->>Entra: Request token for app audience
+    Note over Entra: App has groupMembershipClaims=SecurityGroup<br/>+ optionalClaims for groups in access token
+    Entra-->>CLI: JWT with groups claim:<br/>aud=api://{app_id}<br/>groups=[{group_id}, ...]
+    CLI-->>User: Bearer token (JWT)
+
+    Note over User,Foundry: STEP 2 — Call APIM with User JWT
+
+    User->>APIM: GET /foundry/openai/models<br/>Authorization: Bearer {user-jwt}
+
+    Note over APIM: Inbound Policy Pipeline
+
+    rect rgb(255, 240, 240)
+        APIM->>APIM: 1. validate-jwt<br/>✓ Signature (Entra JWKS)<br/>✓ Audience = api://{app_id}<br/>✓ Issuer = sts.windows.net/{tenant}
+        APIM->>APIM: 2. validate-jwt (groups)<br/>✓ groups claim contains {group_id}<br/>❌ Reject if user not in group
+    end
+
+    Note over APIM,MI: STEP 3 — Token Swap (MI replaces User JWT)
+
+    rect rgb(240, 255, 240)
+        APIM->>MI: authentication-managed-identity<br/>resource=https://cognitiveservices.azure.com
+        MI->>Entra: Request MI token
+        Entra-->>MI: MI Bearer token
+        MI-->>APIM: MI token
+        APIM->>APIM: set-header: Replace Authorization<br/>with MI Bearer token
+    end
+
+    Note over APIM,Foundry: STEP 4 — Forward to Foundry with MI Auth
+
+    APIM->>Foundry: GET /openai/models<br/>Authorization: Bearer {mi-token}
+    Foundry-->>APIM: 200 OK + models list
+    APIM-->>User: 200 OK + models list
+```
+
+### Why This Design
+
+| Aspect | User JWT | SP Token |
+|---|---|---|
+| `groups` claim | ✅ Present (user is a group member) | ❌ Not available |
+| APIM group validation | ✅ Passes | ❌ Rejected (401) |
+| Identity granularity | Per-user audit trail | Shared identity |
+| Revocation | Remove user from group → instant deny | Rotate SP secret |
+| Production pattern | OAuth2 auth code flow (web app) | Client credentials flow |
+
+### Production Mapping
+
+In this POC, `az login` + `az account get-access-token` simulates what a real application would do:
+
+| POC (scripts) | Production (web app) |
+|---|---|
+| `az login` (interactive browser) | OAuth2 Authorization Code Flow (user signs in to web app) |
+| `az account get-access-token --resource api://{app_id}` | MSAL `acquireTokenSilent()` with the app's scope |
+| User JWT sent to APIM | Frontend sends JWT to APIM as `Authorization: Bearer` header |
+| APIM validates groups + swaps to MI | Same — unchanged |
+
+### Service-to-Service Alternative
+
+For **service-to-service** scenarios where no human user is involved (e.g., a backend cronjob calling Foundry), replace the group-based policy with **app role validation**:
+
+1. Define `appRoles` on the app registration instead of using security groups
+2. Assign the client SP to the desired app role
+3. Change the APIM policy from `<claim name="groups">` to `<claim name="roles">`
+4. The client uses OAuth2 **client credentials** flow (`grant_type=client_credentials`) to get a token
+
+This is a different auth pattern and is **not covered** by this POC's scripts.
+
 ## Script Details
 
 ### 00-create-sp.py
@@ -200,16 +379,17 @@ Then obtain a token:
 az account get-access-token --resource api://<client-id> --query accessToken -o tsv
 ```
 
-### Optional: Group-Based Access Control
+### Group-Based Access Control (Automated)
 
-To restrict access to specific Entra security groups:
+Group-based access control is a **core part** of this POC and is fully automated:
 
-1. In your app registration → **Token configuration** → Add `groups` optional claim (for ID and Access tokens)
-2. Add group object IDs to `jwt_policy.allowed_groups` in `config.json`:
-   ```json
-   "allowed_groups": ["<group-object-id-1>", "<group-object-id-2>"]
-   ```
-3. Re-run `python 04-connect-apim.py` to update the policy — it will add a second `validate-jwt` block that checks group membership
+1. **Script 00** creates the Entra security group (`sg-foundry-e2e-users`), adds your user to it, creates an app registration with `groupMembershipClaims: SecurityGroup` and optional claims for `groups` in access/ID tokens — all via separate Graph API calls to avoid silent failures
+2. **Script 04** applies the APIM inbound policy with `<claim name="groups">` validation using the group ID from `config.json`
+3. **Script 05** clears the token cache (`az account clear`), re-logins (`az login --tenant`), and acquires a fresh JWT with the `groups` claim
+
+> **Why the token refresh in script 05?** Tokens issued before the user was added to the security group won't contain the `groups` claim. The `az account clear` + `az login` ensures a fresh token is acquired after group membership is established.
+
+> **Why two separate Graph API calls for the app registration?** Setting `groupMembershipClaims` and `optionalClaims` in the same PATCH request causes `groupMembershipClaims` to be **silently ignored** by the Graph API. Script 00 sets them in two separate calls to work around this.
 
 ## Config Reference
 

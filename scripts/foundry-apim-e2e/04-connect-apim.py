@@ -70,13 +70,16 @@ def run():
     print(f"  MI Principal: {apim_mi}")
 
     # ================================================================
-    # STEP 2: Assign "Cognitive Services OpenAI User" to APIM MI
+    # STEP 2: Assign RBAC for APIM MI + AD Group
     # ================================================================
     print(f"\n{'='*60}")
-    print("STEP 2: Assign RBAC for APIM MI on Foundry account")
+    print("STEP 2: Assign RBAC for APIM MI + AD Group on Foundry")
     print("=" * 60)
 
     acct_scope = account_id(cfg)
+
+    # --- 2a. APIM MI → Account-level roles ---
+    print(f"\n  2a. APIM Managed Identity → Account scope")
     role_def_id = "5e0bd9bd-7b93-4f28-af87-19fc36ad61bd"  # Cognitive Services OpenAI User
     ra_id = str(uuid.uuid4())
     ra_url = f"{ARM}{acct_scope}/providers/Microsoft.Authorization/roleAssignments/{ra_id}?api-version=2022-04-01"
@@ -90,11 +93,11 @@ def run():
 
     r = requests.put(ra_url, headers=h, json=ra_body)
     if r.status_code in (200, 201):
-        print(f"  Cognitive Services OpenAI User: assigned")
+        print(f"      Cognitive Services OpenAI User: assigned")
     elif r.status_code == 409:
-        print(f"  Role already assigned")
+        print(f"      Cognitive Services OpenAI User: already assigned")
     else:
-        print(f"  Warning: {r.status_code} {r.text[:200]}")
+        print(f"      Warning: {r.status_code} {r.text[:200]}")
 
     # Also assign Cognitive Services User for agent calls
     role_cs_user = "a97b65f3-24c7-4388-baec-2e87135dc908"  # Cognitive Services User
@@ -109,11 +112,45 @@ def run():
     }
     r = requests.put(ra2_url, headers=h, json=ra2_body)
     if r.status_code in (200, 201):
-        print(f"  Cognitive Services User: assigned")
+        print(f"      Cognitive Services User: assigned")
     elif r.status_code == 409:
-        print(f"  Role already assigned")
+        print(f"      Cognitive Services User: already assigned")
     else:
-        print(f"  Warning: {r.status_code} {r.text[:200]}")
+        print(f"      Warning: {r.status_code} {r.text[:200]}")
+
+    # --- 2b. AD Group → Project-level roles ---
+    group_id = cfg.get("security_group", {}).get("object_id", "")
+    if group_id:
+        from _auth import project_id as get_project_id
+        proj_scope = get_project_id(cfg)
+        print(f"\n  2b. AD Group → Project scope")
+        print(f"      Group: {cfg['security_group'].get('name', group_id)}")
+        print(f"      Project: {proj_scope}")
+
+        # Cognitive Services OpenAI User on project
+        proj_roles = {
+            "Cognitive Services OpenAI User": "5e0bd9bd-7b93-4f28-af87-19fc36ad61bd",
+            "Azure AI Developer": "64702f94-c441-49e6-a78b-ef80e0188fee",
+        }
+        for role_name, role_id in proj_roles.items():
+            ra_grp_id = str(uuid.uuid4())
+            ra_grp_url = f"{ARM}{proj_scope}/providers/Microsoft.Authorization/roleAssignments/{ra_grp_id}?api-version=2022-04-01"
+            ra_grp_body = {
+                "properties": {
+                    "roleDefinitionId": f"{proj_scope}/providers/Microsoft.Authorization/roleDefinitions/{role_id}",
+                    "principalId": group_id,
+                    "principalType": "Group",
+                }
+            }
+            r = requests.put(ra_grp_url, headers=h, json=ra_grp_body)
+            if r.status_code in (200, 201):
+                print(f"      {role_name}: assigned")
+            elif r.status_code == 409:
+                print(f"      {role_name}: already assigned")
+            else:
+                print(f"      {role_name}: {r.status_code} {r.text[:200]}")
+    else:
+        print(f"\n  2b. AD Group → skipped (no security_group.object_id in config)")
 
     # ================================================================
     # STEP 3: Create "Microsoft Foundry" API in APIM
