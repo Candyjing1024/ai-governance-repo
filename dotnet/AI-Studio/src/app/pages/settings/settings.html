@@ -1,0 +1,75 @@
+<h2>Settings</h2>
+<p class="text-muted">Configure API endpoint URLs for backend services.</p>
+
+@if (saved) {
+  <div class="alert alert-success alert-dismissible">
+    <i class="bi bi-check-circle me-1"></i> Settings saved for this session.
+    <button class="btn-close" (click)="saved = false"></button>
+  </div>
+}
+
+<div class="card border-0 shadow-sm">
+  <div class="card-body">
+    <div class="row g-3">
+      <div class="col-md-6">
+        <label class="form-label">
+          <i class="bi bi-folder me-1 text-primary"></i> Projects API
+        </label>
+        <input class="form-control" [(ngModel)]="endpoints.projectsApi" />
+      </div>
+      <div class="col-md-6">
+        <label class="form-label">
+          <i class="bi bi-box me-1 text-success"></i> Models API
+        </label>
+        <input class="form-control" [(ngModel)]="endpoints.modelsApi" />
+      </div>
+      <div class="col-md-6">
+        <label class="form-label">
+          <i class="bi bi-robot me-1 text-info"></i> Agents API
+        </label>
+        <input class="form-control" [(ngModel)]="endpoints.agentsApi" />
+      </div>
+      <div class="col-md-6">
+        <label class="form-label">
+          <i class="bi bi-hdd-network me-1 text-warning"></i> Gateway API
+        </label>
+        <input class="form-control" [(ngModel)]="endpoints.gatewayApi" />
+      </div>
+      <div class="col-md-6">
+        <label class="form-label">
+          <i class="bi bi-people me-1 text-danger"></i> Users API
+        </label>
+        <input class="form-control" [(ngModel)]="endpoints.usersApi" />
+      </div>
+    </div>
+
+    <div class="mt-4 d-flex gap-2">
+      <button class="btn btn-primary" (click)="save()">
+        <i class="bi bi-check-lg me-1"></i> Save
+      </button>
+      <button class="btn btn-outline-secondary" (click)="reset()">
+        <i class="bi bi-arrow-counterclockwise me-1"></i> Reset to Defaults
+      </button>
+    </div>
+  </div>
+</div>
+
+<div class="card border-0 shadow-sm mt-4">
+  <div class="card-header bg-white">
+    <h6 class="mb-0"><i class="bi bi-info-circle me-1"></i> API Status Guide</h6>
+  </div>
+  <div class="card-body">
+    <table class="table table-sm mb-0">
+      <thead class="table-light">
+        <tr><th>Service</th><th>Default Port</th><th>Purpose</th></tr>
+      </thead>
+      <tbody>
+        <tr><td>ProjectManagementAPI</td><td><code>5218</code></td><td>AI Foundry accounts & projects</td></tr>
+        <tr><td>ModelsManagementAPI</td><td><code>5076</code></td><td>Model deployments & requests</td></tr>
+        <tr><td>AgentManagementAPI</td><td><code>5300</code></td><td>AI agents, threads, runs</td></tr>
+        <tr><td>AIGatewayManagementAPI</td><td><code>5099</code></td><td>APIM APIs, policies, RBAC</td></tr>
+        <tr><td>UserManagementAPI</td><td><code>5145</code></td><td>Entra ID users & groups</td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>

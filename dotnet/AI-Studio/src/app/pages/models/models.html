@@ -1,0 +1,379 @@
+<div class="d-flex justify-content-between align-items-center mb-3">
+  <h2>Models</h2>
+  <div>
+    @if (tab() === 'deployments') {
+      <button class="btn btn-primary" (click)="showCreate = !showCreate">
+        <i class="bi bi-plus-lg me-1"></i> Deploy Model
+      </button>
+    } @else {
+      <button class="btn btn-primary" (click)="showRequest = !showRequest">
+        <i class="bi bi-send me-1"></i> New Request
+      </button>
+    }
+  </div>
+</div>
+
+<!-- Tabs -->
+<ul class="nav nav-tabs mb-3">
+  <li class="nav-item">
+    <a class="nav-link" [class.active]="tab() === 'deployments'" (click)="tab.set('deployments')" role="button">
+      <i class="bi bi-box me-1"></i> Deployments
+    </a>
+  </li>
+  <li class="nav-item">
+    <a class="nav-link" [class.active]="tab() === 'requests'" (click)="tab.set('requests')" role="button">
+      <i class="bi bi-clipboard-check me-1"></i> Requests
+      @if (requests().length > 0) {
+        <span class="badge bg-warning text-dark ms-1">{{ requests().filter(r => r.status === 'requested_pending_approval').length }}</span>
+      }
+    </a>
+  </li>
+</ul>
+
+@if (error()) {
+  <div class="alert alert-danger alert-dismissible">
+    {{ error() }}
+    <button class="btn-close" (click)="error.set('')"></button>
+  </div>
+}
+
+<!-- DEPLOYMENTS TAB -->
+@if (tab() === 'deployments') {
+  <!-- Create Form -->
+  @if (showCreate) {
+    <div class="card border-0 shadow-sm mb-4">
+      <div class="card-body">
+        <h6><i class="bi bi-plus-circle me-1"></i> Deploy Model</h6>
+        <div class="row g-3 mt-1">
+          <div class="col-md-3">
+            <label class="form-label">Model Name <span class="text-danger">*</span></label>
+            <input class="form-control" [(ngModel)]="newDeploy.modelName" placeholder="gpt-4o-mini" />
+          </div>
+          <div class="col-md-3">
+            <label class="form-label">Deployment Name <span class="text-danger">*</span></label>
+            <input class="form-control" [(ngModel)]="newDeploy.deploymentName" placeholder="gpt-4o-mini-prod" />
+          </div>
+          <div class="col-md-2">
+            <label class="form-label">Version <span class="text-danger">*</span></label>
+            <input class="form-control" [(ngModel)]="newDeploy.modelVersion" placeholder="2024-07-18" required />
+          </div>
+          <div class="col-md-2">
+            <label class="form-label">SKU</label>
+            <input class="form-control" [(ngModel)]="newDeploy.skuName" />
+          </div>
+          <div class="col-md-2">
+            <label class="form-label">Capacity</label>
+            <input class="form-control" type="number" [(ngModel)]="newDeploy.skuCapacity" />
+          </div>
+        </div>
+        <div class="mt-3">
+          <button class="btn btn-success me-2" (click)="createDeployment()" [disabled]="creating || !newDeploy.modelName || !newDeploy.deploymentName || !newDeploy.modelVersion">
+            @if (creating) { <span class="spinner-border spinner-border-sm me-1"></span> }
+            Deploy
+          </button>
+          <button class="btn btn-outline-secondary" (click)="showCreate = false">Cancel</button>
+        </div>
+      </div>
+    </div>
+  }
+
+  @if (loading()) {
+    <div class="text-center py-5"><span class="spinner-border"></span></div>
+  } @else if (deployments().length === 0) {
+    <div class="card border-0 shadow-sm">
+      <div class="card-body text-center py-5">
+        <i class="bi bi-box fs-1 text-muted"></i>
+        <p class="mt-2 text-muted">No deployments found.</p>
+      </div>
+    </div>
+  } @else {
+    <div class="card border-0 shadow-sm">
+      <div class="table-responsive">
+        <table class="table table-hover mb-0">
+          <thead class="table-light">
+            <tr>
+              <th>Deployment</th>
+              <th>Model</th>
+              <th>Version</th>
+              <th>SKU</th>
+              <th>Capacity</th>
+              <th>State</th>
+              <th width="120"></th>
+            </tr>
+          </thead>
+          <tbody>
+            @for (d of deployments(); track d.name) {
+              <tr>
+                <td><code>{{ d.name }}</code></td>
+                <td>{{ d.properties?.model?.name }}</td>
+                <td>{{ d.properties?.model?.version ?? '—' }}</td>
+                <td>
+                  @if (editingDeploy?.name === d.name) {
+                    <input class="form-control form-control-sm" [(ngModel)]="editDeployData.skuName" style="width:120px" />
+                  } @else {
+                    {{ d.sku?.name }}
+                  }
+                </td>
+                <td>
+                  @if (editingDeploy?.name === d.name) {
+                    <input class="form-control form-control-sm" type="number" [(ngModel)]="editDeployData.skuCapacity" style="width:80px" />
+                  } @else {
+                    {{ d.sku?.capacity }}
+                  }
+                </td>
+                <td>
+                  @if (d.properties?.provisioningState === 'Succeeded') {
+                    <span class="badge bg-success">Succeeded</span>
+                  } @else {
+                    <span class="badge bg-secondary">{{ d.properties?.provisioningState }}</span>
+                  }
+                </td>
+                <td>
+                  @if (editingDeploy?.name === d.name) {
+                    <button class="btn btn-success btn-sm me-1" (click)="saveEditDeploy()" [disabled]="savingDeploy" title="Save">
+                      @if (savingDeploy) { <span class="spinner-border spinner-border-sm"></span> } @else { <i class="bi bi-check-lg"></i> }
+                    </button>
+                    <button class="btn btn-outline-secondary btn-sm" (click)="cancelEditDeploy()" title="Cancel">
+                      <i class="bi bi-x-lg"></i>
+                    </button>
+                  } @else if (confirmDelete === d.name) {
+                    <button class="btn btn-danger btn-sm me-1" (click)="deleteDeployment(d.name)" [disabled]="deleting" title="Confirm Delete">
+                      @if (deleting) { <span class="spinner-border spinner-border-sm"></span> } @else { <i class="bi bi-check-lg"></i> }
+                    </button>
+                    <button class="btn btn-outline-secondary btn-sm" (click)="cancelDelete()" [disabled]="deleting" title="Cancel">
+                      <i class="bi bi-x-lg"></i>
+                    </button>
+                  } @else {
+                    <button class="btn btn-outline-primary btn-sm me-1" (click)="startEditDeploy(d)" title="Edit">
+                      <i class="bi bi-pencil"></i>
+                    </button>
+                    <button class="btn btn-outline-danger btn-sm" (click)="deleteDeployment(d.name)" title="Delete">
+                      <i class="bi bi-trash"></i>
+                    </button>
+                  }
+                </td>
+              </tr>
+            }
+          </tbody>
+        </table>
+      </div>
+    </div>
+  }
+}
+
+<!-- REQUESTS TAB -->
+@if (tab() === 'requests') {
+  @if (showRequest) {
+    <div class="card border-0 shadow-sm mb-4">
+      <div class="card-body">
+        <h6><i class="bi bi-send me-1"></i> Submit Deployment Request</h6>
+        <div class="row g-3 mt-1">
+          <div class="col-md-3">
+            <label class="form-label">Model <span class="text-danger">*</span></label>
+            <input class="form-control" [(ngModel)]="newRequest.modelName" placeholder="gpt-4o" />
+          </div>
+          <div class="col-md-3">
+            <label class="form-label">Deployment Name <span class="text-danger">*</span></label>
+            <input class="form-control" [(ngModel)]="newRequest.deploymentName" placeholder="gpt-4o-prod" />
+          </div>
+          <div class="col-md-3">
+            <label class="form-label">Project <span class="text-danger">*</span></label>
+            <input class="form-control" [(ngModel)]="newRequest.projectName" placeholder="poc-01-project" />
+          </div>
+          <div class="col-md-3">
+            <label class="form-label">Region <span class="text-danger">*</span></label>
+            <input class="form-control" [(ngModel)]="newRequest.region" />
+          </div>
+          <div class="col-md-2">
+            <label class="form-label">Version <span class="text-danger">*</span></label>
+            <input class="form-control" [(ngModel)]="newRequest.modelVersion" placeholder="2024-07-18" required />
+          </div>
+          <div class="col-md-2">
+            <label class="form-label">SKU</label>
+            <input class="form-control" [(ngModel)]="newRequest.skuName" />
+          </div>
+          <div class="col-md-2">
+            <label class="form-label">Capacity</label>
+            <input class="form-control" type="number" [(ngModel)]="newRequest.skuCapacity" />
+          </div>
+          <div class="col-md-6">
+            <label class="form-label">Business Justification <span class="text-danger">*</span></label>
+            <textarea class="form-control" [(ngModel)]="newRequest.businessJustification" rows="2"></textarea>
+          </div>
+          <div class="col-md-3">
+            <label class="form-label">Request Group <span class="text-danger">*</span></label>
+            <input class="form-control" [(ngModel)]="newRequest.requestGroup" placeholder="Team name" />
+          </div>
+          <div class="col-md-3">
+            <label class="form-label">Requester Email <span class="text-danger">*</span></label>
+            <input class="form-control" [(ngModel)]="newRequest.requestUser" placeholder="user@company.com" />
+          </div>
+        </div>
+        <div class="mt-3">
+          <button class="btn btn-success me-2" (click)="submitRequest()" [disabled]="submitting || !newRequest.modelName || !newRequest.deploymentName || !newRequest.projectName || !newRequest.region || !newRequest.modelVersion || !newRequest.businessJustification || !newRequest.requestGroup || !newRequest.requestUser">
+            @if (submitting) { <span class="spinner-border spinner-border-sm me-1"></span> }
+            Submit
+          </button>
+          <button class="btn btn-outline-secondary" (click)="showRequest = false">Cancel</button>
+        </div>
+      </div>
+    </div>
+  }
+
+  @if (requests().length === 0) {
+    <div class="card border-0 shadow-sm">
+      <div class="card-body text-center py-5">
+        <i class="bi bi-clipboard-check fs-1 text-muted"></i>
+        <p class="mt-2 text-muted">No deployment requests.</p>
+      </div>
+    </div>
+  } @else {
+    <div class="card border-0 shadow-sm">
+      <div class="table-responsive">
+        <table class="table table-hover mb-0">
+          <thead class="table-light">
+            <tr>
+              <th>Deployment</th>
+              <th>Model</th>
+              <th>Project</th>
+              <th>Status</th>
+              <th>Requester</th>
+              <th>Created</th>
+              <th width="120">Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            @for (req of requests(); track req.id) {
+              <tr class="cursor-pointer" (click)="openReview(req)" style="cursor:pointer">
+                <td><code>{{ req.deploymentName }}</code></td>
+                <td>{{ req.modelName }}</td>
+                <td>{{ req.projectName }}</td>
+                <td>
+                  @switch (req.status) {
+                    @case ('requested_pending_approval') { <span class="badge bg-warning text-dark">Pending</span> }
+                    @case ('approved_deployment_in_progress') { <span class="badge bg-info">Deploying</span> }
+                    @case ('approved_deployed_active') { <span class="badge bg-success">Active</span> }
+                    @case ('rejected') { <span class="badge bg-danger">Rejected</span> }
+                    @default { <span class="badge bg-secondary">{{ req.status }}</span> }
+                  }
+                </td>
+                <td>{{ req.requestUser }}</td>
+                <td class="small text-muted">{{ req.createdAt | date:'short' }}</td>
+                <td>
+                  @if (req.status === 'requested_pending_approval') {
+                    <button class="btn btn-outline-primary btn-sm" (click)="openReview(req); $event.stopPropagation()" title="Review">
+                      <i class="bi bi-clipboard-check"></i>
+                    </button>
+                  }
+                </td>
+              </tr>
+            }
+          </tbody>
+        </table>
+      </div>
+    </div>
+  }
+}
+
+<!-- Review Modal -->
+@if (reviewingRequest) {
+  <div class="modal-backdrop fade show"></div>
+  <div class="modal d-block fade show" tabindex="-1" (click)="cancelReview()">
+    <div class="modal-dialog" (click)="$event.stopPropagation()">
+      <div class="modal-content">
+        <div class="modal-header">
+          <h5 class="modal-title">
+            <i class="bi bi-clipboard-check me-2"></i> Deployment Request Details
+          </h5>
+          <button class="btn-close" (click)="cancelReview()"></button>
+        </div>
+        <div class="modal-body">
+          <div class="row g-3">
+            <div class="col-6">
+              <label class="form-label text-muted small mb-0">Deployment Name</label>
+              <div class="fw-semibold">{{ reviewingRequest.deploymentName }}</div>
+            </div>
+            <div class="col-6">
+              <label class="form-label text-muted small mb-0">Model</label>
+              <div class="fw-semibold">{{ reviewingRequest.modelName }}</div>
+            </div>
+            <div class="col-6">
+              <label class="form-label text-muted small mb-0">Project</label>
+              <div class="fw-semibold">{{ reviewingRequest.projectName }}</div>
+            </div>
+            <div class="col-6">
+              <label class="form-label text-muted small mb-0">Region</label>
+              <div class="fw-semibold">{{ reviewingRequest.region ?? '—' }}</div>
+            </div>
+            <div class="col-6">
+              <label class="form-label text-muted small mb-0">Requester</label>
+              <div class="fw-semibold text-break">{{ reviewingRequest.requestUser }}</div>
+            </div>
+            <div class="col-6">
+              <label class="form-label text-muted small mb-0">Team / Group</label>
+              <div class="fw-semibold">{{ reviewingRequest.requestGroup ?? '—' }}</div>
+            </div>
+            <div class="col-6">
+              <label class="form-label text-muted small mb-0">Status</label>
+              <div>
+                @switch (reviewingRequest.status) {
+                  @case ('requested_pending_approval') { <span class="badge bg-warning text-dark">Pending</span> }
+                  @case ('approved_deployment_in_progress') { <span class="badge bg-info">Deploying</span> }
+                  @case ('approved_deployed_active') { <span class="badge bg-success">Active</span> }
+                  @case ('rejected') { <span class="badge bg-danger">Rejected</span> }
+                  @default { <span class="badge bg-secondary">{{ reviewingRequest.status }}</span> }
+                }
+              </div>
+            </div>
+            <div class="col-6">
+              <label class="form-label text-muted small mb-0">Created</label>
+              <div class="fw-semibold">{{ reviewingRequest.createdAt | date:'medium' }}</div>
+            </div>
+            <div class="col-12">
+              <label class="form-label text-muted small mb-0">Business Justification</label>
+              <div class="p-2 bg-light rounded">{{ reviewingRequest.businessJustification ?? 'No justification provided.' }}</div>
+            </div>
+          </div>
+
+          @if (reviewingRequest.status === 'requested_pending_approval') {
+            <hr>
+            <h6>Review</h6>
+            <div class="row g-3">
+              <div class="col-md-6">
+                <label class="form-label">Reviewer Name <span class="text-danger">*</span></label>
+                <input class="form-control" [(ngModel)]="reviewData.reviewer" placeholder="Your name" />
+              </div>
+              <div class="col-md-6">
+                <label class="form-label">Action</label>
+                <div class="btn-group w-100">
+                  <button class="btn" [class]="reviewAction === 'approve' ? 'btn-success' : 'btn-outline-success'" (click)="reviewAction = 'approve'">
+                    <i class="bi bi-check-lg me-1"></i> Approve
+                  </button>
+                  <button class="btn" [class]="reviewAction === 'reject' ? 'btn-danger' : 'btn-outline-danger'" (click)="reviewAction = 'reject'">
+                    <i class="bi bi-x-lg me-1"></i> Reject
+                  </button>
+                </div>
+              </div>
+              @if (reviewAction === 'reject') {
+                <div class="col-12">
+                  <label class="form-label">Rejection Reason</label>
+                  <textarea class="form-control" [(ngModel)]="reviewData.reason" rows="2" placeholder="Reason for rejection..."></textarea>
+                </div>
+              }
+            </div>
+          }
+        </div>
+        <div class="modal-footer">
+          @if (reviewingRequest.status === 'requested_pending_approval') {
+            <button class="btn" [class]="reviewAction === 'approve' ? 'btn-success' : 'btn-danger'"
+                    (click)="submitReview()" [disabled]="reviewing || !reviewData.reviewer">
+              @if (reviewing) { <span class="spinner-border spinner-border-sm me-1"></span> }
+              {{ reviewAction === 'approve' ? 'Approve' : 'Reject' }}
+            </button>
+          }
+          <button class="btn btn-outline-secondary" (click)="cancelReview()" [disabled]="reviewing">Close</button>
+        </div>
+      </div>
+    </div>
+  </div>
+}

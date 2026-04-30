@@ -1,0 +1,1016 @@
+================================================================================
+  MODEL DEPLOYMENT REQUEST WORKFLOW — REST API GUIDE (Foundry V2)
+================================================================================
+
+  Purpose:  Document every REST API call needed to build a Model Deployment
+            Request workflow (submit → review → approve/reject → deploy).
+  Format:   Language-agnostic curl commands. Copy into any HTTP client.
+  Storage:  Azure Cosmos DB (NoSQL)
+  Deploy:   Azure AI Foundry V2 (AIServices kind) + APIM AI Gateway (optional)
+
+  API Versions (latest stable as of 2025-04-24):
+    - Foundry / CognitiveServices ARM: 2024-10-01 (latest GA)
+    - Cosmos DB ARM:                   2024-11-15
+    - Cosmos DB data-plane:            2018-12-31 (x-ms-version header)
+    - APIM ARM:                        2024-06-01-preview (AI Gateway features)
+    - Microsoft Graph:                 v1.0
+
+  Author:   AI Governance Team
+  Date:     2026-04-22 (Updated 2025-04-24 — migrated to Foundry V2 + latest API versions)
+
+================================================================================
+  TABLE OF CONTENTS
+================================================================================
+
+  0. Architecture Overview
+  1. Prerequisites — Get Auth Tokens
+  2. Cosmos DB Setup (Database + Container)
+  3. Submit a Model Deployment Request  (POST → Cosmos)
+  4. List All Requests (Admin Review)    (POST query → Cosmos)
+  5. Approve a Request                   (PATCH → Cosmos)
+  6. Reject a Request                    (PATCH → Cosmos)
+  7. On Approval: Deploy Model to Foundry (PUT → ARM)
+  8. On Approval: Add Model to APIM       (PUT → ARM)
+  9. Full Flow — End-to-End Example
+
+================================================================================
+  0. ARCHITECTURE OVERVIEW
+================================================================================
+
+  The flow has 4 actors and 3 systems:
+
+  ┌────────────┐      ┌────────────────┐      ┌────────────────┐
+  │   User /   │      │  Backend API   │      │   Azure        │
+  │   Chat UI  │─────>│  (your app)    │─────>│   Cosmos DB    │
+  └────────────┘      └───────┬────────┘      └────────────────┘
+                              │
+                   On approve │
+                              ▼
+                    ┌─────────────────┐      ┌────────────────┐
+                    │  Azure AI       │      │  Azure APIM    │
+                    │  Foundry (ARM)  │      │  (optional)    │
+                    └─────────────────┘      └────────────────┘
+
+  Flow:
+
+  1. User says "add models" in chat UI
+     → UI renders a form (Model name, Deployment name, Project, etc.)
+
+  2. User fills form, clicks "Submit request"
+     → Backend POSTs document to Cosmos DB
+     → Status = "requested_pending_approval"
+     → Returns request ID to user
+
+  3. Admin says "review models" in chat UI
+     → Backend queries Cosmos for all requests
+     → UI renders table with Approve / Reject buttons
+
+  4. Admin clicks "Approve"
+     → Backend PATCHes Cosmos status to "approved"
+     → Backend triggers model deployment to Foundry via ARM REST API
+     → (Optional) Backend adds APIM operation for the new deployment
+
+  5. Admin clicks "Reject"
+     → Backend PATCHes Cosmos status to "rejected"
+
+
+================================================================================
+  1. PREREQUISITES — GET AUTH TOKENS
+================================================================================
+
+  You need TWO tokens:
+    A) ARM token — for Cosmos DB management, Foundry deployment, APIM
+    B) Cosmos DB data-plane token — for document CRUD
+
+  The Cosmos DB REST API uses either:
+    - A master key (primary key from Azure portal), OR
+    - Entra ID (AAD) tokens with RBAC
+
+  This guide shows BOTH approaches.
+
+--------------------------------------------------------------------------
+  1A. Get ARM Token (Service Principal)
+--------------------------------------------------------------------------
+
+  Replace these variables in ALL commands below:
+
+  TENANT_ID="<your-entra-tenant-id>"
+  CLIENT_ID="<your-sp-client-id>"
+  CLIENT_SECRET="<your-sp-client-secret>"
+  SUBSCRIPTION_ID="<your-azure-subscription-id>"
+  RESOURCE_GROUP="<your-resource-group>"
+
+  # Get ARM token
+  curl -s -X POST \
+    "https://login.microsoftonline.com/${TENANT_ID}/oauth2/v2.0/token" \
+    -H "Content-Type: application/x-www-form-urlencoded" \
+    -d "grant_type=client_credentials&client_id=${CLIENT_ID}&client_secret=${CLIENT_SECRET}&scope=https://management.azure.com/.default"
+
+  # Response:
+  # { "access_token": "<ARM_TOKEN>", "expires_in": 3599, ... }
+
+  ARM_TOKEN="<paste-access-token-here>"
+
+--------------------------------------------------------------------------
+  1B. Get Cosmos DB Account Info
+--------------------------------------------------------------------------
+
+  Once you create the Cosmos account (Section 2), get the primary key:
+
+  COSMOS_ACCOUNT="<your-cosmos-account-name>"
+  COSMOS_ENDPOINT="https://${COSMOS_ACCOUNT}.documents.azure.com"
+
+  # Get Cosmos keys via ARM
+  curl -s -X POST \
+    "https://management.azure.com/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.DocumentDB/databaseAccounts/${COSMOS_ACCOUNT}/listKeys?api-version=2024-11-15" \
+    -H "Authorization: Bearer ${ARM_TOKEN}" \
+    -H "Content-Type: application/json"
+
+  # Response:
+  # { "primaryMasterKey": "<COSMOS_KEY>", ... }
+
+  COSMOS_KEY="<paste-primary-key-here>"
+
+--------------------------------------------------------------------------
+  1C. Cosmos DB Authorization Header
+--------------------------------------------------------------------------
+
+  The Cosmos DB REST API requires a special Authorization header:
+
+    Authorization: type=master&ver=1.0&sig=<base64-hmac-sha256>
+
+  The signature is computed from:
+    - HTTP verb (GET, POST, PUT, etc.)
+    - Resource type (dbs, colls, docs)
+    - Resource link (dbs/ModelRequests, dbs/ModelRequests/colls/Requests, etc.)
+    - UTC date (x-ms-date header)
+    - The master key
+
+  GENERATING THE AUTH HEADER:
+
+  Since this is complex to do in pure bash, here's a helper function.
+  Paste this in your terminal before running the curl commands:
+
+  ──────────────────────────────────────────────────────────────────
+  generate_cosmos_auth() {
+    # Usage: generate_cosmos_auth <verb> <resourceType> <resourceLink> <date> <key>
+    local VERB=$(echo -n "$1" | tr '[:upper:]' '[:lower:]')
+    local RESOURCE_TYPE=$(echo -n "$2" | tr '[:upper:]' '[:lower:]')
+    local RESOURCE_LINK="$3"
+    local DATE="$4"
+    local KEY="$5"
+
+    local PAYLOAD="${VERB}\n${RESOURCE_TYPE}\n${RESOURCE_LINK}\n${DATE}\n\n"
+    local HEX_KEY=$(echo -n "$KEY" | base64 -d | xxd -p -c 256)
+    local SIG=$(printf "${PAYLOAD}" | openssl dgst -sha256 -mac HMAC \
+      -macopt "hexkey:${HEX_KEY}" -binary | base64)
+    echo -n "type=master&ver=1.0&sig=${SIG}" | python3 -c "import sys,urllib.parse; print(urllib.parse.quote(sys.stdin.read(), safe=''))"
+  }
+  ──────────────────────────────────────────────────────────────────
+
+  NOTE: Every curl command below shows <AUTH_HEADER> as a placeholder.
+  Before each call, run:
+
+    DATE=$(TZ=GMT date '+%a, %d %b %Y %H:%M:%S GMT')
+    AUTH=$(generate_cosmos_auth "<VERB>" "<resourceType>" "<resourceLink>" "$DATE" "$COSMOS_KEY")
+
+  Then use: -H "Authorization: ${AUTH}" -H "x-ms-date: ${DATE}"
+
+
+================================================================================
+  2. COSMOS DB SETUP (DATABASE + CONTAINER)
+================================================================================
+
+--------------------------------------------------------------------------
+  2A. Create Cosmos DB Account (ARM REST API)
+--------------------------------------------------------------------------
+
+  Endpoint: PUT https://management.azure.com/subscriptions/{sub}/resourceGroups/{rg}
+                /providers/Microsoft.DocumentDB/databaseAccounts/{accountName}
+                ?api-version=2024-11-15
+
+  curl -s -X PUT \
+    "https://management.azure.com/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.DocumentDB/databaseAccounts/${COSMOS_ACCOUNT}?api-version=2024-11-15" \
+    -H "Authorization: Bearer ${ARM_TOKEN}" \
+    -H "Content-Type: application/json" \
+    -d '{
+      "location": "eastus",
+      "kind": "GlobalDocumentDB",
+      "properties": {
+        "databaseAccountOfferType": "Standard",
+        "locations": [
+          {
+            "locationName": "eastus",
+            "failoverPriority": 0
+          }
+        ],
+        "consistencyPolicy": {
+          "defaultConsistencyLevel": "Session"
+        },
+        "capabilities": [
+          { "name": "EnableServerless" }
+        ]
+      }
+    }'
+
+  # Response: 200/201 — account provisioning starts
+  # Poll until provisioningState = "Succeeded" (~2-5 minutes)
+
+  # Check status:
+  curl -s \
+    "https://management.azure.com/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.DocumentDB/databaseAccounts/${COSMOS_ACCOUNT}?api-version=2024-11-15" \
+    -H "Authorization: Bearer ${ARM_TOKEN}" \
+    | python3 -c "import sys,json; print(json.load(sys.stdin)['properties']['provisioningState'])"
+
+--------------------------------------------------------------------------
+  2B. Create Database: "ModelRequests"
+--------------------------------------------------------------------------
+
+  Endpoint: POST https://{account}.documents.azure.com/dbs
+  Resource type: dbs
+  Resource link: (empty for creating a db)
+
+  DATE=$(TZ=GMT date '+%a, %d %b %Y %H:%M:%S GMT')
+  AUTH=$(generate_cosmos_auth "post" "dbs" "" "$DATE" "$COSMOS_KEY")
+
+  curl -s -X POST \
+    "${COSMOS_ENDPOINT}/dbs" \
+    -H "Authorization: ${AUTH}" \
+    -H "x-ms-date: ${DATE}" \
+    -H "x-ms-version: 2018-12-31" \
+    -H "Content-Type: application/json" \
+    -d '{
+      "id": "ModelRequests"
+    }'
+
+  # Response: 201 Created
+  # {
+  #   "id": "ModelRequests",
+  #   "_rid": "...",
+  #   "_self": "dbs/ModelRequests/",
+  #   ...
+  # }
+
+--------------------------------------------------------------------------
+  2C. Create Container: "Requests" (partition key: /project_name)
+--------------------------------------------------------------------------
+
+  Endpoint: POST https://{account}.documents.azure.com/dbs/ModelRequests/colls
+  Resource type: colls
+  Resource link: dbs/ModelRequests
+
+  DATE=$(TZ=GMT date '+%a, %d %b %Y %H:%M:%S GMT')
+  AUTH=$(generate_cosmos_auth "post" "colls" "dbs/ModelRequests" "$DATE" "$COSMOS_KEY")
+
+  curl -s -X POST \
+    "${COSMOS_ENDPOINT}/dbs/ModelRequests/colls" \
+    -H "Authorization: ${AUTH}" \
+    -H "x-ms-date: ${DATE}" \
+    -H "x-ms-version: 2018-12-31" \
+    -H "Content-Type: application/json" \
+    -d '{
+      "id": "Requests",
+      "partitionKey": {
+        "paths": ["/project_name"],
+        "kind": "Hash",
+        "version": 2
+      }
+    }'
+
+  # Response: 201 Created
+
+
+  DOCUMENT SCHEMA:
+  ──────────────────────────────────────────────────────────────────
+  {
+    "id":                  "<uuid>",
+    "model_name":          "gpt-4o-mini",
+    "deployment_name":     "gpt-4o-mini-prod",
+    "project_name":        "my-chainlit-app",
+    "foundry_resource":    "my-chubbdemoai-resource",
+    "tpm":                 100000,
+    "region":              "eastus2",
+    "resource_group":      "my-foundry-rg",
+    "business_justification": "Customer support chatbot needs GPT-4o-mini",
+    "status":              "requested_pending_approval",
+    "requested_by":        "user@company.com",
+    "requested_at":        "2026-04-22T10:30:00Z",
+    "reviewed_by":         null,
+    "reviewed_at":         null,
+    "deployment_id":       null
+  }
+  ──────────────────────────────────────────────────────────────────
+
+  Partition key:  /project_name
+  Reason:         Requests are typically queried per-project. This gives
+                  good distribution and allows efficient project-scoped queries.
+
+
+================================================================================
+  3. SUBMIT A MODEL DEPLOYMENT REQUEST (POST → Cosmos)
+================================================================================
+
+  This is called when the user fills the form and clicks "Submit request".
+
+  Endpoint: POST https://{account}.documents.azure.com
+                 /dbs/ModelRequests/colls/Requests/docs
+  Resource type: docs
+  Resource link: dbs/ModelRequests/colls/Requests
+
+  REQUEST_ID=$(python3 -c "import uuid; print(str(uuid.uuid4()))")
+  TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+  DATE=$(TZ=GMT date '+%a, %d %b %Y %H:%M:%S GMT')
+  AUTH=$(generate_cosmos_auth "post" "docs" "dbs/ModelRequests/colls/Requests" "$DATE" "$COSMOS_KEY")
+
+  curl -s -X POST \
+    "${COSMOS_ENDPOINT}/dbs/ModelRequests/colls/Requests/docs" \
+    -H "Authorization: ${AUTH}" \
+    -H "x-ms-date: ${DATE}" \
+    -H "x-ms-version: 2018-12-31" \
+    -H "Content-Type: application/json" \
+    -H "x-ms-documentdb-partitionkey: [\"my-chainlit-app\"]" \
+    -d "{
+      \"id\": \"${REQUEST_ID}\",
+      \"model_name\": \"gpt-4o-mini\",
+      \"deployment_name\": \"gpt-4o-mini-prod\",
+      \"project_name\": \"my-chainlit-app\",
+      \"foundry_resource\": \"my-chubbdemoai-resource\",
+      \"tpm\": 100000,
+      \"region\": \"eastus2\",
+      \"resource_group\": \"my-foundry-rg\",
+      \"business_justification\": \"Customer support chatbot needs GPT-4o-mini for faster responses\",
+      \"status\": \"requested_pending_approval\",
+      \"requested_by\": \"developer@company.com\",
+      \"requested_at\": \"${TIMESTAMP}\",
+      \"reviewed_by\": null,
+      \"reviewed_at\": null,
+      \"deployment_id\": null
+    }"
+
+  # Response: 201 Created
+  # {
+  #   "id": "98ded938-f3f2-4e40-91b8-b85ec93aaa16",
+  #   "model_name": "gpt-4o-mini",
+  #   "status": "requested_pending_approval",
+  #   ...
+  # }
+
+  WHAT YOUR BACKEND RETURNS TO THE UI:
+  ──────────────────────────────────────────────────────────────────
+  {
+    "message": "Request submitted",
+    "request_id": "98ded938-f3f2-4e40-91b8-b85ec93aaa16",
+    "model_name": "gpt-4o-mini",
+    "status": "requested_pending_approval"
+  }
+  ──────────────────────────────────────────────────────────────────
+
+
+================================================================================
+  4. LIST ALL REQUESTS — ADMIN REVIEW (POST query → Cosmos)
+================================================================================
+
+  This is called when the admin says "review models" in the chat.
+  Uses Cosmos DB SQL query API.
+
+--------------------------------------------------------------------------
+  4A. List ALL requests (any status)
+--------------------------------------------------------------------------
+
+  Endpoint: POST https://{account}.documents.azure.com
+                 /dbs/ModelRequests/colls/Requests/docs
+  Resource type: docs
+  Resource link: dbs/ModelRequests/colls/Requests
+  IMPORTANT: Set x-ms-documentdb-isquery: True and enable cross-partition
+
+  DATE=$(TZ=GMT date '+%a, %d %b %Y %H:%M:%S GMT')
+  AUTH=$(generate_cosmos_auth "post" "docs" "dbs/ModelRequests/colls/Requests" "$DATE" "$COSMOS_KEY")
+
+  curl -s -X POST \
+    "${COSMOS_ENDPOINT}/dbs/ModelRequests/colls/Requests/docs" \
+    -H "Authorization: ${AUTH}" \
+    -H "x-ms-date: ${DATE}" \
+    -H "x-ms-version: 2018-12-31" \
+    -H "Content-Type: application/query+json" \
+    -H "x-ms-documentdb-isquery: True" \
+    -H "x-ms-documentdb-query-enablecrosspartition: True" \
+    -d '{
+      "query": "SELECT c.id, c.model_name, c.deployment_name, c.project_name, c.foundry_resource, c.resource_group, c.tpm, c.region, c.status, c.requested_by, c.requested_at, c.reviewed_by, c.reviewed_at FROM c ORDER BY c.requested_at DESC"
+    }'
+
+  # Response: 200 OK
+  # {
+  #   "Documents": [
+  #     {
+  #       "id": "98ded938-...",
+  #       "model_name": "gpt-4o-mini",
+  #       "project_name": "my-chainlit-app",
+  #       "status": "requested_pending_approval",
+  #       ...
+  #     },
+  #     ...
+  #   ],
+  #   "_count": 7
+  # }
+
+--------------------------------------------------------------------------
+  4B. List only PENDING requests (for admin action)
+--------------------------------------------------------------------------
+
+  DATE=$(TZ=GMT date '+%a, %d %b %Y %H:%M:%S GMT')
+  AUTH=$(generate_cosmos_auth "post" "docs" "dbs/ModelRequests/colls/Requests" "$DATE" "$COSMOS_KEY")
+
+  curl -s -X POST \
+    "${COSMOS_ENDPOINT}/dbs/ModelRequests/colls/Requests/docs" \
+    -H "Authorization: ${AUTH}" \
+    -H "x-ms-date: ${DATE}" \
+    -H "x-ms-version: 2018-12-31" \
+    -H "Content-Type: application/query+json" \
+    -H "x-ms-documentdb-isquery: True" \
+    -H "x-ms-documentdb-query-enablecrosspartition: True" \
+    -d '{
+      "query": "SELECT * FROM c WHERE c.status = @status",
+      "parameters": [
+        { "name": "@status", "value": "requested_pending_approval" }
+      ]
+    }'
+
+  NOTE: Always use parameterized queries (@status) to prevent injection.
+
+--------------------------------------------------------------------------
+  4C. Get a SINGLE request by ID
+--------------------------------------------------------------------------
+
+  Endpoint: GET https://{account}.documents.azure.com
+                /dbs/ModelRequests/colls/Requests/docs/{id}
+  Resource type: docs
+  Resource link: dbs/ModelRequests/colls/Requests/docs/{id}
+
+  REQUEST_ID="98ded938-f3f2-4e40-91b8-b85ec93aaa16"
+  PROJECT_NAME="my-chainlit-app"
+
+  DATE=$(TZ=GMT date '+%a, %d %b %Y %H:%M:%S GMT')
+  AUTH=$(generate_cosmos_auth "get" "docs" "dbs/ModelRequests/colls/Requests/docs/${REQUEST_ID}" "$DATE" "$COSMOS_KEY")
+
+  curl -s -X GET \
+    "${COSMOS_ENDPOINT}/dbs/ModelRequests/colls/Requests/docs/${REQUEST_ID}" \
+    -H "Authorization: ${AUTH}" \
+    -H "x-ms-date: ${DATE}" \
+    -H "x-ms-version: 2018-12-31" \
+    -H "x-ms-documentdb-partitionkey: [\"${PROJECT_NAME}\"]"
+
+
+================================================================================
+  5. APPROVE A REQUEST (PATCH → Cosmos + trigger deploy)
+================================================================================
+
+  When the admin clicks "Approve", your backend does TWO things:
+    A) Update status in Cosmos DB to "approved"
+    B) Trigger model deployment to Foundry (Section 7)
+
+--------------------------------------------------------------------------
+  5A. Update document status to "approved"
+--------------------------------------------------------------------------
+
+  Cosmos DB supports partial updates via PATCH (JSON Patch operations).
+
+  Endpoint: PATCH https://{account}.documents.azure.com
+                  /dbs/ModelRequests/colls/Requests/docs/{id}
+  Resource type: docs
+  Resource link: dbs/ModelRequests/colls/Requests/docs/{id}
+
+  REQUEST_ID="98ded938-f3f2-4e40-91b8-b85ec93aaa16"
+  PROJECT_NAME="my-chainlit-app"
+  REVIEW_TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+  DATE=$(TZ=GMT date '+%a, %d %b %Y %H:%M:%S GMT')
+  AUTH=$(generate_cosmos_auth "patch" "docs" "dbs/ModelRequests/colls/Requests/docs/${REQUEST_ID}" "$DATE" "$COSMOS_KEY")
+
+  curl -s -X PATCH \
+    "${COSMOS_ENDPOINT}/dbs/ModelRequests/colls/Requests/docs/${REQUEST_ID}" \
+    -H "Authorization: ${AUTH}" \
+    -H "x-ms-date: ${DATE}" \
+    -H "x-ms-version: 2018-12-31" \
+    -H "Content-Type: application/json" \
+    -H "x-ms-documentdb-partitionkey: [\"${PROJECT_NAME}\"]" \
+    -d "{
+      \"operations\": [
+        { \"op\": \"set\", \"path\": \"/status\", \"value\": \"approved\" },
+        { \"op\": \"set\", \"path\": \"/reviewed_by\", \"value\": \"admin@company.com\" },
+        { \"op\": \"set\", \"path\": \"/reviewed_at\", \"value\": \"${REVIEW_TIMESTAMP}\" }
+      ]
+    }"
+
+  # Response: 200 OK — document updated
+
+--------------------------------------------------------------------------
+  5B. After status update, trigger deployment (see Section 7)
+--------------------------------------------------------------------------
+
+  Your backend should:
+    1. Read the approved request from Cosmos to get model details
+    2. Call the Foundry ARM API to deploy the model (Section 7)
+    3. On success, update the request with the deployment_id (Section 5C)
+
+--------------------------------------------------------------------------
+  5C. Update request with deployment info (after successful deploy)
+--------------------------------------------------------------------------
+
+  DATE=$(TZ=GMT date '+%a, %d %b %Y %H:%M:%S GMT')
+  AUTH=$(generate_cosmos_auth "patch" "docs" "dbs/ModelRequests/colls/Requests/docs/${REQUEST_ID}" "$DATE" "$COSMOS_KEY")
+
+  curl -s -X PATCH \
+    "${COSMOS_ENDPOINT}/dbs/ModelRequests/colls/Requests/docs/${REQUEST_ID}" \
+    -H "Authorization: ${AUTH}" \
+    -H "x-ms-date: ${DATE}" \
+    -H "x-ms-version: 2018-12-31" \
+    -H "Content-Type: application/json" \
+    -H "x-ms-documentdb-partitionkey: [\"${PROJECT_NAME}\"]" \
+    -d "{
+      \"operations\": [
+        { \"op\": \"set\", \"path\": \"/status\", \"value\": \"deployed\" },
+        { \"op\": \"set\", \"path\": \"/deployment_id\", \"value\": \"gpt-4o-mini-prod\" }
+      ]
+    }"
+
+
+================================================================================
+  6. REJECT A REQUEST (PATCH → Cosmos)
+================================================================================
+
+  Same as approve, but set status to "rejected".
+
+  REQUEST_ID="<the-request-id>"
+  PROJECT_NAME="<the-project-name>"
+  REVIEW_TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+
+  DATE=$(TZ=GMT date '+%a, %d %b %Y %H:%M:%S GMT')
+  AUTH=$(generate_cosmos_auth "patch" "docs" "dbs/ModelRequests/colls/Requests/docs/${REQUEST_ID}" "$DATE" "$COSMOS_KEY")
+
+  curl -s -X PATCH \
+    "${COSMOS_ENDPOINT}/dbs/ModelRequests/colls/Requests/docs/${REQUEST_ID}" \
+    -H "Authorization: ${AUTH}" \
+    -H "x-ms-date: ${DATE}" \
+    -H "x-ms-version: 2018-12-31" \
+    -H "Content-Type: application/json" \
+    -H "x-ms-documentdb-partitionkey: [\"${PROJECT_NAME}\"]" \
+    -d "{
+      \"operations\": [
+        { \"op\": \"set\", \"path\": \"/status\", \"value\": \"rejected\" },
+        { \"op\": \"set\", \"path\": \"/reviewed_by\", \"value\": \"admin@company.com\" },
+        { \"op\": \"set\", \"path\": \"/reviewed_at\", \"value\": \"${REVIEW_TIMESTAMP}\" }
+      ]
+    }"
+
+  # Response: 200 OK
+
+
+================================================================================
+  7. ON APPROVAL: DEPLOY MODEL TO FOUNDRY V2 (PUT → ARM)
+================================================================================
+
+  This is the ARM REST API to deploy a model on a Foundry V2 (AIServices kind)
+  account. Uses api-version 2024-10-01 (latest GA for Microsoft.CognitiveServices).
+  This is the same API used in our foundry-apim-e2e/02-deploy-model.py.
+
+  Endpoint: PUT https://management.azure.com
+                /subscriptions/{sub}/resourceGroups/{rg}
+                /providers/Microsoft.CognitiveServices/accounts/{account}
+                /deployments/{deploymentName}
+                ?api-version=2024-10-01
+
+  Variables from the approved request:
+
+  FOUNDRY_ACCOUNT="my-chubbdemoai-resource"   # from request.foundry_resource
+  DEPLOYMENT_NAME="gpt-4o-mini-prod"          # from request.deployment_name
+  MODEL_NAME="gpt-4o-mini"                    # from request.model_name
+  MODEL_VERSION="2024-07-18"                  # look up latest version for model
+  SKU="GlobalStandard"                        # standard SKU
+  TPM=100000                                  # from request.tpm
+  RG="my-foundry-rg"                          # from request.resource_group
+
+  curl -s -X PUT \
+    "https://management.azure.com/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RG}/providers/Microsoft.CognitiveServices/accounts/${FOUNDRY_ACCOUNT}/deployments/${DEPLOYMENT_NAME}?api-version=2024-10-01" \
+    -H "Authorization: Bearer ${ARM_TOKEN}" \
+    -H "Content-Type: application/json" \
+    -d "{
+      \"sku\": {
+        \"name\": \"${SKU}\",
+        \"capacity\": ${TPM}
+      },
+      \"properties\": {
+        \"model\": {
+          \"format\": \"OpenAI\",
+          \"name\": \"${MODEL_NAME}\",
+          \"version\": \"${MODEL_VERSION}\"
+        }
+      }
+    }"
+
+  # Response: 201 Created (or 200 if updating existing)
+  #
+  # Poll for completion:
+  # GET same URL → check properties.provisioningState = "Succeeded"
+
+  POLL UNTIL DEPLOYED:
+
+  while true; do
+    STATE=$(curl -s \
+      "https://management.azure.com/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RG}/providers/Microsoft.CognitiveServices/accounts/${FOUNDRY_ACCOUNT}/deployments/${DEPLOYMENT_NAME}?api-version=2024-10-01" \
+      -H "Authorization: Bearer ${ARM_TOKEN}" \
+      | python3 -c "import sys,json; print(json.load(sys.stdin).get('properties',{}).get('provisioningState','?'))")
+    echo "Deployment state: ${STATE}"
+    if [ "$STATE" = "Succeeded" ]; then break; fi
+    sleep 15
+  done
+
+  MODEL VERSION LOOKUP:
+
+  If you need to find the latest version for a given model name:
+
+  curl -s \
+    "https://management.azure.com/subscriptions/${SUBSCRIPTION_ID}/providers/Microsoft.CognitiveServices/locations/eastus/models?api-version=2024-10-01" \
+    -H "Authorization: Bearer ${ARM_TOKEN}" \
+    | python3 -c "
+import sys, json
+data = json.load(sys.stdin)
+for m in data.get('value', []):
+    if m['model']['name'] == 'gpt-4o-mini':
+        skus = m['model'].get('skus', [])
+        print(f\"  name={m['model']['name']}  version={m['model']['version']}  skus={[s['name'] for s in skus]}\")
+"
+
+
+================================================================================
+  8. ON APPROVAL: ADD MODEL TO APIM (PUT → ARM) — OPTIONAL
+================================================================================
+
+  If you front Foundry with APIM (as in our foundry-apim-e2e POC), you may
+  want to add an APIM operation for the newly deployed model.
+
+  This adds a chat/completions operation for the new deployment.
+
+  APIM_NAME="<your-apim-name>"
+  APIM_API_VERSION="2024-06-01-preview"
+  API_ID="foundry-api"
+  OPERATION_ID="chat-completions-${DEPLOYMENT_NAME}"
+
+  Endpoint: PUT https://management.azure.com
+                /subscriptions/{sub}/resourceGroups/{rg}
+                /providers/Microsoft.ApiManagement/service/{apim}
+                /apis/{apiId}/operations/{operationId}
+                ?api-version=2024-06-01-preview
+
+  curl -s -X PUT \
+    "https://management.azure.com/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/${RESOURCE_GROUP}/providers/Microsoft.ApiManagement/service/${APIM_NAME}/apis/${API_ID}/operations/${OPERATION_ID}?api-version=${APIM_API_VERSION}" \
+    -H "Authorization: Bearer ${ARM_TOKEN}" \
+    -H "Content-Type: application/json" \
+    -d "{
+      \"properties\": {
+        \"displayName\": \"Chat Completions - ${DEPLOYMENT_NAME}\",
+        \"method\": \"POST\",
+        \"urlTemplate\": \"/openai/deployments/${DEPLOYMENT_NAME}/chat/completions\",
+        \"templateParameters\": [],
+        \"description\": \"Chat completions for deployment ${DEPLOYMENT_NAME} (auto-provisioned)\"
+      }
+    }"
+
+  # Response: 200/201 — operation added to APIM
+
+  NOTE: The APIM inbound policy (JWT validation + MI swap) already applies
+  at the API level, so the new operation inherits all auth automatically.
+
+
+================================================================================
+  9. FULL FLOW — END-TO-END EXAMPLE
+================================================================================
+
+  Here's the complete sequence with actual curl commands, assuming
+  all variables from Section 1 are set.
+
+  STEP 1: Create Cosmos DB account, database, container
+  ──────────────────────────────────────────────────────
+  (Run commands from Sections 2A, 2B, 2C — one-time setup)
+
+
+  STEP 2: User submits request
+  ──────────────────────────────────────────────────────
+
+  REQUEST_ID=$(python3 -c "import uuid; print(str(uuid.uuid4()))")
+  TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+  DATE=$(TZ=GMT date '+%a, %d %b %Y %H:%M:%S GMT')
+  AUTH=$(generate_cosmos_auth "post" "docs" "dbs/ModelRequests/colls/Requests" "$DATE" "$COSMOS_KEY")
+
+  curl -s -X POST \
+    "${COSMOS_ENDPOINT}/dbs/ModelRequests/colls/Requests/docs" \
+    -H "Authorization: ${AUTH}" \
+    -H "x-ms-date: ${DATE}" \
+    -H "x-ms-version: 2018-12-31" \
+    -H "Content-Type: application/json" \
+    -H "x-ms-documentdb-partitionkey: [\"customer-support-bot\"]" \
+    -d "{
+      \"id\": \"${REQUEST_ID}\",
+      \"model_name\": \"gpt-4o-mini\",
+      \"deployment_name\": \"gpt-4o-mini-prod\",
+      \"project_name\": \"customer-support-bot\",
+      \"foundry_resource\": \"my-chubbdemoai-resource\",
+      \"tpm\": 100000,
+      \"region\": \"eastus2\",
+      \"resource_group\": \"my-foundry-rg\",
+      \"business_justification\": \"Need GPT-4o-mini for customer support chatbot\",
+      \"status\": \"requested_pending_approval\",
+      \"requested_by\": \"dev@company.com\",
+      \"requested_at\": \"${TIMESTAMP}\",
+      \"reviewed_by\": null,
+      \"reviewed_at\": null,
+      \"deployment_id\": null
+    }"
+
+  echo "Request ID: ${REQUEST_ID}"
+
+
+  STEP 3: Admin queries all pending requests
+  ──────────────────────────────────────────────────────
+
+  DATE=$(TZ=GMT date '+%a, %d %b %Y %H:%M:%S GMT')
+  AUTH=$(generate_cosmos_auth "post" "docs" "dbs/ModelRequests/colls/Requests" "$DATE" "$COSMOS_KEY")
+
+  curl -s -X POST \
+    "${COSMOS_ENDPOINT}/dbs/ModelRequests/colls/Requests/docs" \
+    -H "Authorization: ${AUTH}" \
+    -H "x-ms-date: ${DATE}" \
+    -H "x-ms-version: 2018-12-31" \
+    -H "Content-Type: application/query+json" \
+    -H "x-ms-documentdb-isquery: True" \
+    -H "x-ms-documentdb-query-enablecrosspartition: True" \
+    -d '{
+      "query": "SELECT * FROM c WHERE c.status = \"requested_pending_approval\" ORDER BY c.requested_at DESC"
+    }' | python3 -m json.tool
+
+
+  STEP 4: Admin approves → update Cosmos + deploy model
+  ──────────────────────────────────────────────────────
+
+  # 4a. Update status in Cosmos
+  REVIEW_TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+  DATE=$(TZ=GMT date '+%a, %d %b %Y %H:%M:%S GMT')
+  AUTH=$(generate_cosmos_auth "patch" "docs" "dbs/ModelRequests/colls/Requests/docs/${REQUEST_ID}" "$DATE" "$COSMOS_KEY")
+
+  curl -s -X PATCH \
+    "${COSMOS_ENDPOINT}/dbs/ModelRequests/colls/Requests/docs/${REQUEST_ID}" \
+    -H "Authorization: ${AUTH}" \
+    -H "x-ms-date: ${DATE}" \
+    -H "x-ms-version: 2018-12-31" \
+    -H "Content-Type: application/json" \
+    -H "x-ms-documentdb-partitionkey: [\"customer-support-bot\"]" \
+    -d "{
+      \"operations\": [
+        { \"op\": \"set\", \"path\": \"/status\", \"value\": \"approved\" },
+        { \"op\": \"set\", \"path\": \"/reviewed_by\", \"value\": \"admin@company.com\" },
+        { \"op\": \"set\", \"path\": \"/reviewed_at\", \"value\": \"${REVIEW_TIMESTAMP}\" }
+      ]
+    }"
+
+  # 4b. Deploy model to Foundry
+  curl -s -X PUT \
+    "https://management.azure.com/subscriptions/${SUBSCRIPTION_ID}/resourceGroups/my-foundry-rg/providers/Microsoft.CognitiveServices/accounts/my-chubbdemoai-resource/deployments/gpt-4o-mini-prod?api-version=2024-10-01" \
+    -H "Authorization: Bearer ${ARM_TOKEN}" \
+    -H "Content-Type: application/json" \
+    -d '{
+      "sku": { "name": "GlobalStandard", "capacity": 100000 },
+      "properties": {
+        "model": {
+          "format": "OpenAI",
+          "name": "gpt-4o-mini",
+          "version": "2024-07-18"
+        }
+      }
+    }'
+
+  # 4c. Poll until deployed, then update Cosmos with deployment_id
+  # (see Section 7 for poll loop)
+
+
+  STEP 5: Admin rejects a different request
+  ──────────────────────────────────────────────────────
+
+  REJECT_ID="<other-request-id>"
+  REJECT_PROJECT="<project-name>"
+  REVIEW_TIMESTAMP=$(date -u +"%Y-%m-%dT%H:%M:%SZ")
+  DATE=$(TZ=GMT date '+%a, %d %b %Y %H:%M:%S GMT')
+  AUTH=$(generate_cosmos_auth "patch" "docs" "dbs/ModelRequests/colls/Requests/docs/${REJECT_ID}" "$DATE" "$COSMOS_KEY")
+
+  curl -s -X PATCH \
+    "${COSMOS_ENDPOINT}/dbs/ModelRequests/colls/Requests/docs/${REJECT_ID}" \
+    -H "Authorization: ${AUTH}" \
+    -H "x-ms-date: ${DATE}" \
+    -H "x-ms-version: 2018-12-31" \
+    -H "Content-Type: application/json" \
+    -H "x-ms-documentdb-partitionkey: [\"${REJECT_PROJECT}\"]" \
+    -d "{
+      \"operations\": [
+        { \"op\": \"set\", \"path\": \"/status\", \"value\": \"rejected\" },
+        { \"op\": \"set\", \"path\": \"/reviewed_by\", \"value\": \"admin@company.com\" },
+        { \"op\": \"set\", \"path\": \"/reviewed_at\", \"value\": \"${REVIEW_TIMESTAMP}\" }
+      ]
+    }"
+
+
+================================================================================
+  API REFERENCE — QUICK LOOKUP TABLE
+================================================================================
+
+  ┌─────────────────────────┬────────┬──────────────────────────────────────────┐
+  │ ACTION                  │ METHOD │ ENDPOINT                                 │
+  ├─────────────────────────┼────────┼──────────────────────────────────────────┤
+  │ Create Cosmos DB account│ PUT    │ ARM: .../databaseAccounts/{name}         │
+  │ Create database         │ POST   │ Cosmos: /dbs                             │
+  │ Create container        │ POST   │ Cosmos: /dbs/{db}/colls                  │
+  │ Submit request          │ POST   │ Cosmos: /dbs/{db}/colls/{c}/docs         │
+  │ List all requests       │ POST   │ Cosmos: /dbs/{db}/colls/{c}/docs (query)│
+  │ Get single request      │ GET    │ Cosmos: /dbs/{db}/colls/{c}/docs/{id}    │
+  │ Approve (update status) │ PATCH  │ Cosmos: /dbs/{db}/colls/{c}/docs/{id}    │
+  │ Reject (update status)  │ PATCH  │ Cosmos: /dbs/{db}/colls/{c}/docs/{id}    │
+  │ Deploy model            │ PUT    │ ARM: .../accounts/{a}/deployments/{d}    │
+  │ Poll deployment         │ GET    │ ARM: .../accounts/{a}/deployments/{d}    │
+  │ List models (versions)  │ GET    │ ARM: .../locations/{loc}/models          │
+  │ Add APIM operation      │ PUT    │ ARM: .../service/{s}/apis/{a}/ops/{o}    │
+  └─────────────────────────┴────────┴──────────────────────────────────────────┘
+
+
+  ┌─────────────────────────────┬───────────────────────────────────────────────┐
+  │ API VERSIONS                │ VALUE                                         │
+  ├─────────────────────────────┼───────────────────────────────────────────────┤
+  │ Cosmos DB (ARM)             │ 2024-11-15                                    │
+  │ Cosmos DB (data plane)      │ 2018-12-31 (x-ms-version header)             │
+  │ Foundry V2 / CogSvc (ARM)  │ 2024-10-01 (latest GA)                       │
+  │ APIM (ARM)                  │ 2024-06-01-preview (AI Gateway features)     │
+  └─────────────────────────────┴───────────────────────────────────────────────┘
+
+
+================================================================================
+  STATUS VALUES
+================================================================================
+
+  ┌────────────────────────────┬────────────────────────────────────────────────┐
+  │ STATUS                     │ MEANING                                        │
+  ├────────────────────────────┼────────────────────────────────────────────────┤
+  │ requested_pending_approval │ User submitted, waiting for admin review        │
+  │ approved                   │ Admin approved, deployment triggered            │
+  │ deployed                   │ Model successfully deployed to Foundry          │
+  │ rejected                   │ Admin rejected the request                      │
+  │ failed                     │ Deployment failed (check deployment_error)      │
+  └────────────────────────────┴────────────────────────────────────────────────┘
+
+
+================================================================================
+  NOTES FOR DEVELOPERS
+================================================================================
+
+  1. COSMOS AUTH HEADER
+     The Cosmos DB data-plane REST API requires HMAC-SHA256 auth headers.
+     Most SDKs (Python azure-cosmos, .NET, Java, Node.js) handle this
+     automatically. The generate_cosmos_auth bash function above is only
+     needed for raw curl calls.
+
+     SDK equivalents:
+       Python:  from azure.cosmos import CosmosClient
+       .NET:    using Microsoft.Azure.Cosmos;
+       Node.js: const { CosmosClient } = require("@azure/cosmos");
+       Java:    com.azure.cosmos.CosmosClient
+
+  2. PARTITION KEY
+     The x-ms-documentdb-partitionkey header must match the document's
+     partition key value. Format: ["value"] (JSON array with string).
+     For cross-partition queries, use x-ms-documentdb-query-enablecrosspartition.
+
+  3. IDEMPOTENCY
+     Model deployments (PUT) are idempotent — re-running with the same
+     deployment name updates the existing deployment rather than creating
+     a duplicate.
+
+  4. ERROR HANDLING
+     - Cosmos 409: Document with that ID already exists
+     - Cosmos 404: Document or container not found
+     - ARM 409: Deployment already exists (check current state)
+     - ARM 403: Missing RBAC role (need Cognitive Services Contributor)
+
+  5. SECURITY
+     - Never expose COSMOS_KEY in client-side code or chat responses
+     - Use Entra ID RBAC (Cosmos DB Built-in Data Contributor role) for
+       production instead of master keys
+     - Validate user roles before allowing approve/reject operations
+     - The ARM_TOKEN (SP credentials) should only be used server-side
+
+  6. ALTERNATIVE: COSMOS DB SDK (recommended for production)
+     Instead of raw REST, use the SDK which handles auth, retries, and
+     pagination automatically:
+
+     Python example:
+       from azure.cosmos import CosmosClient, PartitionKey
+       client = CosmosClient(endpoint, credential=key)
+       db = client.get_database_client("ModelRequests")
+       container = db.get_container_client("Requests")
+       container.create_item(body={...})
+       items = container.query_items("SELECT * FROM c WHERE c.status=@s",
+                                     parameters=[{"name":"@s","value":"requested_pending_approval"}],
+                                     enable_cross_partition_query=True)
+
+================================================================================
+  MICROSOFT DOCUMENTATION REFERENCES
+================================================================================
+
+  All API versions used in this document are the latest stable releases as of
+  2025-04-24. Below are the official Microsoft documentation links.
+
+  ── Azure AI Foundry / Cognitive Services (ARM REST API) ──────────────────
+
+  API Version: 2024-10-01 (latest GA)
+
+  • Deployments - Create Or Update
+    https://learn.microsoft.com/en-us/rest/api/aiservices/accountmanagement/deployments/create-or-update?view=rest-aiservices-accountmanagement-2024-10-01
+
+  • Deployments - Get
+    https://learn.microsoft.com/en-us/rest/api/aiservices/accountmanagement/deployments/get?view=rest-aiservices-accountmanagement-2024-10-01
+
+  • Accounts - Create
+    https://learn.microsoft.com/en-us/rest/api/aiservices/accountmanagement/accounts/create?view=rest-aiservices-accountmanagement-2024-10-01
+
+  • Models - List
+    https://learn.microsoft.com/en-us/rest/api/aiservices/accountmanagement/models/list?view=rest-aiservices-accountmanagement-2024-10-01
+
+  • Full API reference (2024-10-01)
+    https://learn.microsoft.com/en-us/rest/api/aiservices/accountmanagement?view=rest-aiservices-accountmanagement-2024-10-01
+
+  ── Azure Cosmos DB (Data-Plane REST API) ─────────────────────────────────
+
+  API Version: 2018-12-31 (x-ms-version header, latest data-plane version)
+
+  • Azure Cosmos DB REST API Reference
+    https://learn.microsoft.com/en-us/rest/api/cosmos-db/
+
+  • Create a Document
+    https://learn.microsoft.com/en-us/rest/api/cosmos-db/create-a-document
+
+  • Query Documents
+    https://learn.microsoft.com/en-us/rest/api/cosmos-db/query-documents
+
+  • Patch a Document (Partial Update)
+    https://learn.microsoft.com/en-us/rest/api/cosmos-db/patch-a-document
+
+  • Supported REST API Versions
+    https://learn.microsoft.com/en-us/rest/api/cosmos-db/supported-rest-api-versions
+
+  ── Azure Cosmos DB (ARM REST API) ────────────────────────────────────────
+
+  API Version: 2024-11-15
+
+  • Database Accounts - Create Or Update
+    https://learn.microsoft.com/en-us/rest/api/cosmos-db-resource-provider/database-accounts/create-or-update?view=rest-cosmos-db-resource-provider-2024-11-15
+
+  ── Azure API Management (ARM REST API) ───────────────────────────────────
+
+  API Version: 2024-06-01-preview (required for AI Gateway / azure-ai-foundry features)
+
+  • APIM REST API Reference
+    https://learn.microsoft.com/en-us/rest/api/apimanagement/
+
+  • Api Operations - Create Or Update
+    https://learn.microsoft.com/en-us/rest/api/apimanagement/api-operation/create-or-update
+
+  • APIM AI Gateway overview
+    https://learn.microsoft.com/en-us/azure/api-management/ai-gateway-overview
+
+  ── Microsoft Graph ───────────────────────────────────────────────────────
+
+  API Version: v1.0 (stable)
+
+  • Microsoft Graph REST API v1.0
+    https://learn.microsoft.com/en-us/graph/api/overview?view=graph-rest-1.0
+
+  ── Azure AI Foundry Concepts & Guides ────────────────────────────────────
+
+  • What is Azure AI Foundry?
+    https://learn.microsoft.com/en-us/azure/ai-studio/what-is-ai-studio
+
+  • Azure AI Foundry model deployment
+    https://learn.microsoft.com/en-us/azure/ai-studio/concepts/deployments-overview
+
+  • Azure AI Foundry resource & project architecture
+    https://learn.microsoft.com/en-us/azure/ai-studio/concepts/architecture
+
+  ── Azure RBAC & Authentication ───────────────────────────────────────────
+
+  • Cognitive Services Contributor role
+    https://learn.microsoft.com/en-us/azure/role-based-access-control/built-in-roles/ai-machine-learning#cognitive-services-contributor
+
+  • Cosmos DB Built-in Data Contributor role
+    https://learn.microsoft.com/en-us/azure/cosmos-db/how-to-setup-rbac
+
+  • Microsoft Entra ID - OAuth 2.0 client credentials flow
+    https://learn.microsoft.com/en-us/entra/identity-platform/v2-oauth2-client-creds-grant-flow
+
+================================================================================
+  END OF GUIDE
+================================================================================

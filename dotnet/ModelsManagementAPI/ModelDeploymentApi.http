@@ -1,0 +1,6 @@
+@ModelDeploymentApi_HostAddress = http://localhost:5076
+
+GET {{ModelDeploymentApi_HostAddress}}/weatherforecast/
+Accept: application/json
+
+###

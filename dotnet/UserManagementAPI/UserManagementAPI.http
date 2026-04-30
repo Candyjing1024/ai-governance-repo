@@ -1,0 +1,54 @@
+@UserManagementAPI_HostAddress = http://localhost:5145
+
+### Health check
+GET {{UserManagementAPI_HostAddress}}/api/users/health
+Accept: application/json
+
+###
+
+### ===== T14A: Look up user by email =====
+GET {{UserManagementAPI_HostAddress}}/api/users/developer@company.com
+Accept: application/json
+
+###
+
+### ===== T13: Create Entra security group =====
+POST {{UserManagementAPI_HostAddress}}/api/groups
+Content-Type: application/json
+
+{
+  "displayName": "sg-customer-support-users",
+  "description": "Users authorized to access gpt-4o-mini-prod deployment"
+}
+
+###
+
+### ===== T13: Get group by ID =====
+# Replace {groupId} with the ID returned from the create call
+GET {{UserManagementAPI_HostAddress}}/api/groups/{groupId}
+Accept: application/json
+
+###
+
+### ===== T14: Add user to group (by email) =====
+# Replace {groupId} with the group's ID
+POST {{UserManagementAPI_HostAddress}}/api/groups/{groupId}/members
+Content-Type: application/json
+
+{
+  "userEmail": "developer@company.com"
+}
+
+###
+
+### ===== T16: List group members =====
+# Replace {groupId} with the group's ID
+GET {{UserManagementAPI_HostAddress}}/api/groups/{groupId}/members
+Accept: application/json
+
+###
+
+### ===== T15: Remove user from group =====
+# Replace {groupId} and {userId} with actual IDs
+DELETE {{UserManagementAPI_HostAddress}}/api/groups/{groupId}/members/{userId}
+Accept: application/json

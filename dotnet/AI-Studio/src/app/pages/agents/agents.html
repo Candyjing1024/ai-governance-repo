@@ -1,0 +1,210 @@
+<div class="d-flex justify-content-between align-items-center mb-3">
+  <h2>Agents</h2>
+  <div>
+    @if (tab() === 'agents') {
+      <button class="btn btn-primary" (click)="showCreate = !showCreate">
+        <i class="bi bi-plus-lg me-1"></i> New Agent
+      </button>
+    } @else {
+      <button class="btn btn-outline-secondary" (click)="tab.set('agents')">
+        <i class="bi bi-arrow-left me-1"></i> Back to Agents
+      </button>
+    }
+  </div>
+</div>
+
+<!-- Tabs -->
+<ul class="nav nav-tabs mb-3">
+  <li class="nav-item">
+    <a class="nav-link" [class.active]="tab() === 'agents'" (click)="tab.set('agents')" role="button">
+      <i class="bi bi-robot me-1"></i> Agents
+    </a>
+  </li>
+  <li class="nav-item">
+    <a class="nav-link" [class.active]="tab() === 'playground'" role="button" [class.disabled]="!selectedAgent()">
+      <i class="bi bi-chat-dots me-1"></i> Playground
+      @if (selectedAgent()) {
+        <span class="text-muted small ms-1">— {{ selectedAgent()?.name }}</span>
+      }
+    </a>
+  </li>
+</ul>
+
+@if (error()) {
+  <div class="alert alert-danger alert-dismissible">
+    {{ error() }}
+    <button class="btn-close" (click)="error.set('')"></button>
+  </div>
+}
+
+<!-- AGENTS TAB -->
+@if (tab() === 'agents') {
+  @if (showCreate) {
+    <div class="card border-0 shadow-sm mb-4">
+      <div class="card-body">
+        <h6><i class="bi bi-plus-circle me-1"></i> Create Agent</h6>
+        <div class="row g-3 mt-1">
+          <div class="col-md-4">
+            <label class="form-label">Name <span class="text-danger">*</span></label>
+            <input class="form-control" [(ngModel)]="newAgent.name" placeholder="my-assistant" />
+          </div>
+          <div class="col-md-4">
+            <label class="form-label">Model <span class="text-danger">*</span></label>
+            <input class="form-control" [(ngModel)]="newAgent.model" />
+          </div>
+          <div class="col-md-4">
+            <label class="form-label">Description</label>
+            <input class="form-control" [(ngModel)]="newAgent.description" placeholder="Optional description" />
+          </div>
+          <div class="col-md-12">
+            <label class="form-label">Instructions</label>
+            <textarea class="form-control" [(ngModel)]="newAgent.instructions" rows="3" placeholder="You are a helpful assistant..."></textarea>
+          </div>
+        </div>
+        <div class="mt-3">
+          <button class="btn btn-success me-2" (click)="createAgent()" [disabled]="creating || !newAgent.name || !newAgent.model">
+            @if (creating) { <span class="spinner-border spinner-border-sm me-1"></span> }
+            Create
+          </button>
+          <button class="btn btn-outline-secondary" (click)="showCreate = false">Cancel</button>
+        </div>
+      </div>
+    </div>
+  }
+
+  @if (loading()) {
+    <div class="text-center py-5"><span class="spinner-border"></span></div>
+  } @else if (agents().length === 0) {
+    <div class="card border-0 shadow-sm">
+      <div class="card-body text-center py-5">
+        <i class="bi bi-robot fs-1 text-muted"></i>
+        <p class="mt-2 text-muted">No agents found. Create one to get started.</p>
+      </div>
+    </div>
+  } @else {
+    <div class="card border-0 shadow-sm">
+      <div class="table-responsive">
+        <table class="table table-hover mb-0">
+          <thead class="table-light">
+            <tr>
+              <th>Name</th>
+              <th>Model</th>
+              <th>Instructions</th>
+              <th width="180">Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            @for (a of agents(); track a.name ?? a.id) {
+              <tr>
+                <td><code>{{ a.name ?? a.id }}</code></td>
+                <td>
+                  @if (editingAgent && (editingAgent.name ?? editingAgent.id) === (a.name ?? a.id)) {
+                    <input class="form-control form-control-sm" [(ngModel)]="editAgentData.model" style="width:140px" />
+                  } @else {
+                    {{ a.model ?? a.versions?.latest?.definition?.model ?? '—' }}
+                  }
+                </td>
+                <td>
+                  @if (editingAgent && (editingAgent.name ?? editingAgent.id) === (a.name ?? a.id)) {
+                    <textarea class="form-control form-control-sm" [(ngModel)]="editAgentData.instructions" rows="2"></textarea>
+                  } @else {
+                    <span class="text-muted small text-truncate d-inline-block" style="max-width: 300px">
+                      {{ a.instructions ?? a.versions?.latest?.definition?.instructions ?? '—' }}
+                    </span>
+                  }
+                </td>
+                <td>
+                  @if (editingAgent && (editingAgent.name ?? editingAgent.id) === (a.name ?? a.id)) {
+                    <button class="btn btn-success btn-sm me-1" (click)="saveEditAgent()" [disabled]="savingAgent" title="Save">
+                      @if (savingAgent) { <span class="spinner-border spinner-border-sm"></span> } @else { <i class="bi bi-check-lg"></i> }
+                    </button>
+                    <button class="btn btn-outline-secondary btn-sm" (click)="cancelEditAgent()" title="Cancel">
+                      <i class="bi bi-x-lg"></i>
+                    </button>
+                  } @else if (confirmDelete === (a.name ?? a.id)) {
+                    <button class="btn btn-danger btn-sm me-1" (click)="deleteAgent(a.name ?? a.id)" [disabled]="deleting" title="Confirm Delete">
+                      @if (deleting) { <span class="spinner-border spinner-border-sm"></span> } @else { <i class="bi bi-check-lg"></i> }
+                    </button>
+                    <button class="btn btn-outline-secondary btn-sm" (click)="cancelDelete()" [disabled]="deleting" title="Cancel">
+                      <i class="bi bi-x-lg"></i>
+                    </button>
+                  } @else {
+                    <button class="btn btn-outline-primary btn-sm me-1" (click)="startEditAgent(a)" title="Edit">
+                      <i class="bi bi-pencil"></i>
+                    </button>
+                    <button class="btn btn-outline-primary btn-sm me-1" (click)="openPlayground(a)" title="Chat">
+                      <i class="bi bi-chat-dots"></i>
+                    </button>
+                    <button class="btn btn-outline-danger btn-sm" (click)="deleteAgent(a.name ?? a.id)" title="Delete">
+                      <i class="bi bi-trash"></i>
+                    </button>
+                  }
+                </td>
+              </tr>
+            }
+          </tbody>
+        </table>
+      </div>
+    </div>
+  }
+}
+
+<!-- PLAYGROUND TAB -->
+@if (tab() === 'playground' && selectedAgent()) {
+  <div class="card border-0 shadow-sm" style="height: 500px; display: flex; flex-direction: column;">
+    <div class="card-header bg-white d-flex justify-content-between align-items-center">
+      <span><i class="bi bi-chat-dots me-1"></i> Chat with <strong>{{ selectedAgent()?.name }}</strong></span>
+      <div class="d-flex align-items-center gap-2">
+        <div class="form-check form-switch mb-0">
+          <input class="form-check-input" type="checkbox" id="apimToggle" [checked]="useApim" (change)="toggleApim()" />
+          <label class="form-check-label small" for="apimToggle">
+            Via APIM
+            @if (useApim) { <span class="badge bg-warning text-dark ms-1">Gateway</span> }
+            @else { <span class="badge bg-secondary ms-1">Direct</span> }
+          </label>
+        </div>
+        @if (useApim && apimApis().length > 0) {
+          <select class="form-select form-select-sm" style="width: auto" [(ngModel)]="selectedApimApi" (ngModelChange)="onApimApiChange()">
+            @for (api of apimApis(); track api.name) {
+              <option [value]="api.properties?.path ?? api.name">{{ api.properties?.displayName ?? api.name }}</option>
+            }
+          </select>
+        }
+        @if (runStatus()) {
+          <span class="badge bg-info">{{ runStatus() }}</span>
+        }
+      </div>
+    </div>
+    <div class="card-body overflow-auto flex-grow-1" style="min-height: 0">
+      @if (messages().length === 0) {
+        <p class="text-muted text-center mt-5">Send a message to start the conversation.</p>
+      }
+      @for (m of messages(); track $index) {
+        <div class="mb-3" [class.text-end]="m.role === 'user'">
+          <div class="d-inline-block p-2 px-3 rounded-3"
+               [class.bg-primary]="m.role === 'user'" [class.text-white]="m.role === 'user'"
+               [class.bg-light]="m.role !== 'user'" style="max-width: 80%">
+            <small class="d-block fw-bold mb-1">{{ m.role === 'user' ? 'You' : 'Agent' }}</small>
+            {{ m.content }}
+          </div>
+        </div>
+      }
+      @if (sending) {
+        <div class="mb-3">
+          <div class="d-inline-block p-2 px-3 rounded-3 bg-light">
+            <span class="spinner-border spinner-border-sm me-1"></span> Thinking…
+          </div>
+        </div>
+      }
+    </div>
+    <div class="card-footer bg-white">
+      <div class="input-group">
+        <input class="form-control" [(ngModel)]="userMessage" placeholder="Type your message…"
+               (keyup.enter)="sendMessage()" [disabled]="sending" />
+        <button class="btn btn-primary" (click)="sendMessage()" [disabled]="sending || !userMessage.trim()">
+          <i class="bi bi-send"></i>
+        </button>
+      </div>
+    </div>
+  </div>
+}

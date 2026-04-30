@@ -1,0 +1,117 @@
+@AgentManagementAPI_HostAddress = http://localhost:5300
+
+### Health Check
+GET {{AgentManagementAPI_HostAddress}}/api/agents/health
+Accept: application/json
+
+###
+
+# ========== Agent CRUD ==========
+
+### List Agents
+GET {{AgentManagementAPI_HostAddress}}/api/agents
+Accept: application/json
+
+###
+
+### Create Agent (prompt kind — idempotent)
+POST {{AgentManagementAPI_HostAddress}}/api/agents
+Content-Type: application/json
+
+{
+  "name": "poc-support-agent",
+  "model": "gpt-4o-mini",
+  "kind": "prompt",
+  "instructions": "You are a helpful support assistant for insurance inquiries. Be concise and professional.",
+  "description": "PoC support agent for customer inquiries"
+}
+
+###
+
+@agentId = {{replace-with-agent-id}}
+
+### Get Agent
+GET {{AgentManagementAPI_HostAddress}}/api/agents/{{agentId}}
+Accept: application/json
+
+###
+
+### Update Agent
+PATCH {{AgentManagementAPI_HostAddress}}/api/agents/{{agentId}}
+Content-Type: application/json
+
+{
+  "instructions": "You are an expert insurance assistant. Answer questions about policies, claims, and coverage. Be concise."
+}
+
+###
+
+### Delete Agent
+DELETE {{AgentManagementAPI_HostAddress}}/api/agents/{{agentId}}
+
+###
+
+# ========== Conversations ==========
+
+### Create Conversation
+POST {{AgentManagementAPI_HostAddress}}/api/conversations
+Content-Type: application/json
+
+{
+  "metadata": {
+    "userId": "developer@company.com",
+    "purpose": "test-conversation"
+  }
+}
+
+###
+
+@threadId = {{replace-with-thread-id}}
+
+### Get Conversation
+GET {{AgentManagementAPI_HostAddress}}/api/conversations/{{threadId}}
+Accept: application/json
+
+###
+
+# ========== Messages ==========
+
+### Add User Message
+POST {{AgentManagementAPI_HostAddress}}/api/conversations/{{threadId}}/messages
+Content-Type: application/json
+
+{
+  "role": "user",
+  "content": "Hello, what can you help me with?"
+}
+
+###
+
+### List Messages (chat history)
+GET {{AgentManagementAPI_HostAddress}}/api/conversations/{{threadId}}/messages
+Accept: application/json
+
+###
+
+# ========== Runs ==========
+
+### Run Agent on Conversation
+POST {{AgentManagementAPI_HostAddress}}/api/conversations/{{threadId}}/runs
+Content-Type: application/json
+
+{
+  "assistantId": "{{agentId}}"
+}
+
+###
+
+@runId = {{replace-with-run-id}}
+
+### Get Run Status
+GET {{AgentManagementAPI_HostAddress}}/api/conversations/{{threadId}}/runs/{{runId}}
+Accept: application/json
+
+###
+
+### Delete Conversation
+DELETE {{AgentManagementAPI_HostAddress}}/api/conversations/{{threadId}}

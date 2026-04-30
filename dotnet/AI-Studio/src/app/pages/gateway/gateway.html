@@ -1,0 +1,434 @@
+<div class="d-flex justify-content-between align-items-center mb-3">
+  <div>
+    <h2>AI Gateway</h2>
+    @if (apim()) {
+      <p class="text-muted mb-0">
+        <strong>{{ apim()?.name }}</strong> — {{ apim()?.location }} ({{ apim()?.sku?.name }})
+      </p>
+    }
+  </div>
+  <div>
+    @if (tab() === 'apis') {
+      <button class="btn btn-primary" (click)="showCreate = !showCreate">
+        <i class="bi bi-plus-lg me-1"></i> Add API
+      </button>
+    } @else {
+      <button class="btn btn-primary" (click)="showAssign = !showAssign">
+        <i class="bi bi-shield-plus me-1"></i> Assign Role
+      </button>
+    }
+  </div>
+</div>
+
+<!-- Tabs -->
+<ul class="nav nav-tabs mb-3">
+  <li class="nav-item">
+    <a class="nav-link" [class.active]="tab() === 'apis'" (click)="tab.set('apis')" role="button">
+      <i class="bi bi-hdd-network me-1"></i> APIs
+    </a>
+  </li>
+  <li class="nav-item">
+    <a class="nav-link" [class.active]="tab() === 'rbac'" (click)="tab.set('rbac')" role="button">
+      <i class="bi bi-shield-lock me-1"></i> RBAC
+    </a>
+  </li>
+</ul>
+
+@if (error()) {
+  <div class="alert alert-danger alert-dismissible">
+    {{ error() }}
+    <button class="btn-close" (click)="error.set('')"></button>
+  </div>
+}
+
+<!-- APIS TAB -->
+@if (tab() === 'apis') {
+  @if (showCreate) {
+    <div class="card border-0 shadow-sm mb-4">
+      <div class="card-body">
+        <h6><i class="bi bi-plus-circle me-1"></i> Add API</h6>
+        <div class="row g-3 mt-1">
+          <div class="col-md-3">
+            <label class="form-label">API ID <span class="text-danger">*</span></label>
+            <input class="form-control" [(ngModel)]="newApi.apiId" placeholder="my-api" />
+          </div>
+          <div class="col-md-3">
+            <label class="form-label">Display Name <span class="text-danger">*</span></label>
+            <input class="form-control" [(ngModel)]="newApi.displayName" placeholder="My API" />
+          </div>
+          <div class="col-md-3">
+            <label class="form-label">Service URL <small class="text-muted">(auto-configured)</small></label>
+            <input class="form-control" [(ngModel)]="newApi.serviceUrl" placeholder="Uses configured Foundry endpoint" />
+          </div>
+          <div class="col-md-3">
+            <label class="form-label">Path <span class="text-danger">*</span></label>
+            <input class="form-control" [(ngModel)]="newApi.path" placeholder="/my-api" />
+          </div>
+        </div>
+        <div class="mt-3">
+          <button class="btn btn-success me-2" (click)="createApi()" [disabled]="creating || !newApi.apiId || !newApi.displayName || !newApi.path">
+            @if (creating) { <span class="spinner-border spinner-border-sm me-1"></span> }
+            Create
+          </button>
+          <button class="btn btn-outline-secondary" (click)="showCreate = false">Cancel</button>
+        </div>
+      </div>
+    </div>
+  }
+
+  <div class="row">
+    <!-- API List -->
+    <div class="col-md-4">
+      @if (loading()) {
+        <div class="text-center py-5"><span class="spinner-border"></span></div>
+      } @else if (apis().length === 0) {
+        <div class="card border-0 shadow-sm">
+          <div class="card-body text-center py-4">
+            <i class="bi bi-hdd-network fs-2 text-muted"></i>
+            <p class="mt-2 text-muted small">No APIs found.</p>
+          </div>
+        </div>
+      } @else {
+        <div class="list-group shadow-sm">
+          @for (api of apis(); track api.name ?? api.id) {
+            <button class="list-group-item list-group-item-action d-flex justify-content-between align-items-center"
+                    [class.active]="selectedApi()?.name === api.name || selectedApi()?.id === api.id"
+                    (click)="selectApi(api)">
+              <div>
+                <strong>{{ api.properties?.displayName ?? api.name }}</strong>
+                <br><small class="text-muted">{{ api.properties?.path ?? '' }}</small>
+              </div>
+              @if (confirmDelete === (api.name ?? api.id)) {
+                <div (click)="$event.stopPropagation()">
+                  <button class="btn btn-danger btn-sm me-1" (click)="deleteApi(api.name ?? api.id)" [disabled]="deleting">
+                    @if (deleting) { <span class="spinner-border spinner-border-sm"></span> } @else { <i class="bi bi-check-lg"></i> }
+                  </button>
+                  <button class="btn btn-outline-secondary btn-sm" (click)="cancelDelete()" [disabled]="deleting">
+                    <i class="bi bi-x-lg"></i>
+                  </button>
+                </div>
+              } @else {
+                <button class="btn btn-outline-danger btn-sm" (click)="deleteApi(api.name ?? api.id); $event.stopPropagation()" title="Delete">
+                  <i class="bi bi-trash"></i>
+                </button>
+              }
+            </button>
+          }
+        </div>
+      }
+    </div>
+
+    <!-- API Detail -->
+    <div class="col-md-8">
+      @if (selectedApi()) {
+        @if (loadingDetail()) {
+          <div class="card border-0 shadow-sm">
+            <div class="card-body text-center py-5">
+              <span class="spinner-border"></span>
+              <p class="text-muted mt-2">Loading API details…</p>
+            </div>
+          </div>
+        } @else {
+        <!-- Operations -->
+        <div class="card border-0 shadow-sm mb-3">
+          <div class="card-header bg-white"><h6 class="mb-0"><i class="bi bi-list me-1"></i> Operations</h6></div>
+          <div class="card-body p-0">
+            @if (operations().length === 0) {
+              <p class="text-muted text-center py-3 mb-0">No operations.</p>
+            } @else {
+              <div class="table-responsive">
+                <table class="table table-sm table-hover mb-0">
+                  <thead class="table-light">
+                    <tr><th>Method</th><th>URL</th><th>Display Name</th></tr>
+                  </thead>
+                  <tbody>
+                    @for (op of operations(); track op.name) {
+                      <tr>
+                        <td><span class="badge bg-primary">{{ op.properties?.method }}</span></td>
+                        <td><code>{{ getOperationFullUrl(op) }}</code></td>
+                        <td>{{ op.properties?.displayName }}</td>
+                      </tr>
+                    }
+                  </tbody>
+                </table>
+              </div>
+            }
+          </div>
+        </div>
+
+        <!-- Policy -->
+        <div class="card border-0 shadow-sm mb-3">
+          <div class="card-header bg-white d-flex justify-content-between align-items-center">
+            <h6 class="mb-0"><i class="bi bi-file-code me-1"></i> Policy</h6>
+            @if (!editingPolicy) {
+              <button class="btn btn-outline-primary btn-sm" (click)="startEditPolicy()" title="Edit Policy">
+                <i class="bi bi-pencil me-1"></i> Edit
+              </button>
+            }
+          </div>
+          <div class="card-body">
+            @if (editingPolicy) {
+              <div class="row g-3">
+                <div class="col-md-4">
+                  <label class="form-label">Audience (App Client ID) <span class="text-danger">*</span></label>
+                  <input class="form-control form-control-sm" [(ngModel)]="policyEdit.audience" placeholder="App registration client ID" />
+                </div>
+                <div class="col-md-4">
+                  <label class="form-label">Foundry Endpoint</label>
+                  <input class="form-control form-control-sm" [(ngModel)]="policyEdit.foundryEndpoint" placeholder="https://..." />
+                </div>
+                <div class="col-md-4">
+                  <label class="form-label">Allowed Groups (comma-separated)</label>
+                  <input class="form-control form-control-sm" [(ngModel)]="policyEdit.allowedGroups" placeholder="group-id-1, group-id-2" />
+                </div>
+              </div>
+              <div class="mt-2">
+                <button class="btn btn-success btn-sm me-1" (click)="savePolicy()" [disabled]="savingPolicy || !policyEdit.audience">
+                  @if (savingPolicy) { <span class="spinner-border spinner-border-sm me-1"></span> }
+                  Save Policy
+                </button>
+                <button class="btn btn-outline-secondary btn-sm" (click)="cancelEditPolicy()">Cancel</button>
+              </div>
+            } @else if (policy()) {
+              <pre class="bg-light p-3 rounded small mb-0" style="max-height: 300px; overflow: auto"><code>{{ policy() }}</code></pre>
+            } @else {
+              <p class="text-muted mb-0">No policy configured.</p>
+            }
+          </div>
+        </div>
+
+        <!-- Groups -->
+        <div class="card border-0 shadow-sm mb-3">
+          <div class="card-header bg-white"><h6 class="mb-0"><i class="bi bi-people me-1"></i> Policy Groups</h6></div>
+          <div class="card-body p-0">
+            @if (policyGroups().length === 0) {
+              <p class="text-muted text-center py-3 mb-0">No groups assigned.</p>
+            } @else {
+              <ul class="list-group list-group-flush">
+                @for (g of policyGroups(); track g) {
+                  <li class="list-group-item d-flex justify-content-between align-items-center">
+                    <div>
+                      <i class="bi bi-people-fill me-2 text-success"></i>
+                      <strong>{{ groupNames()[g] ?? 'Loading...' }}</strong>
+                      <code class="small text-muted ms-2">{{ g }}</code>
+                    </div>
+                  </li>
+                }
+              </ul>
+            }
+          </div>
+        </div>
+
+        <!-- Model Restrictions -->
+        <div class="card border-0 shadow-sm">
+          <div class="card-header bg-white d-flex justify-content-between align-items-center">
+            <h6 class="mb-0"><i class="bi bi-lock me-1"></i> Model Restrictions</h6>
+            <button class="btn btn-outline-primary btn-sm" (click)="showAddRestriction = !showAddRestriction">
+              <i class="bi bi-plus-lg me-1"></i> Add
+            </button>
+          </div>
+          <div class="card-body p-0">
+            @if (showAddRestriction) {
+              <div class="p-3 border-bottom bg-light">
+                <div class="row g-2">
+                  <div class="col-md-5">
+                    <label class="form-label small">Group ID <span class="text-danger">*</span></label>
+                    <input class="form-control form-control-sm" [(ngModel)]="newRestriction.groupId" placeholder="Entra group ID" />
+                  </div>
+                  <div class="col-md-5">
+                    <label class="form-label small">Allowed Models <span class="text-danger">*</span></label>
+                    <div class="dropdown">
+                      <button class="btn btn-outline-secondary btn-sm dropdown-toggle w-100 text-start d-flex justify-content-between align-items-center" type="button" (click)="modelsDropdownOpen = !modelsDropdownOpen">
+                        <span>
+                        @if (newRestriction.allowedModels.length === 0) {
+                          Select models...
+                        } @else {
+                          {{ newRestriction.allowedModels.length }} model(s) selected
+                        }
+                        </span>
+                      </button>
+                      @if (modelsDropdownOpen) {
+                        <div class="dropdown-menu show w-100 p-2" style="max-height: 200px; overflow-y: auto;">
+                          @for (m of foundryModels(); track m.name) {
+                            <div class="form-check">
+                              <input class="form-check-input" type="checkbox" [id]="'model-' + m.name"
+                                     [checked]="newRestriction.allowedModels.includes(m.name)"
+                                     (change)="toggleModelSelection(m.name)" />
+                              <label class="form-check-label small" [for]="'model-' + m.name">
+                                {{ m.name }} <span class="text-muted">({{ m.properties?.model?.name }})</span>
+                              </label>
+                            </div>
+                          }
+                        </div>
+                      }
+                    </div>
+                    @if (newRestriction.allowedModels.length > 0) {
+                      <div class="mt-1">
+                        @for (name of newRestriction.allowedModels; track name) {
+                          <span class="badge bg-info text-dark me-1 mb-1">
+                            {{ name }}
+                            <i class="bi bi-x-circle ms-1" role="button" (click)="toggleModelSelection(name)"></i>
+                          </span>
+                        }
+                      </div>
+                    }
+                  </div>
+                  <div class="col-md-2 d-flex align-items-end gap-1">
+                    <button class="btn btn-success btn-sm" (click)="addModelRestriction()" [disabled]="addingRestriction || !newRestriction.groupId || newRestriction.allowedModels.length === 0">
+                      @if (addingRestriction) { <span class="spinner-border spinner-border-sm"></span> } @else { <i class="bi bi-check-lg"></i> }
+                    </button>
+                    <button class="btn btn-outline-secondary btn-sm" (click)="showAddRestriction = false">
+                      <i class="bi bi-x-lg"></i>
+                    </button>
+                  </div>
+                </div>
+              </div>
+            }
+            @if (modelRestrictions().length === 0 && !showAddRestriction) {
+              <p class="text-muted text-center py-3 mb-0">No model restrictions. All groups have unrestricted access.</p>
+            } @else {
+              <ul class="list-group list-group-flush">
+                @for (r of modelRestrictions(); track r.groupId) {
+                  <li class="list-group-item d-flex justify-content-between align-items-center">
+                    <div>
+                      <i class="bi bi-shield-lock me-2 text-warning"></i>
+                      <strong>{{ groupNames()[r.groupId] ?? r.groupId }}</strong>
+                      <code class="small text-muted ms-2">{{ r.groupId }}</code>
+                      <br>
+                      <small class="text-muted ms-4">
+                        Allowed:
+                        @for (m of r.allowedModels; track m) {
+                          <span class="badge bg-info text-dark me-1">{{ m }}</span>
+                        }
+                      </small>
+                    </div>
+                    @if (confirmRemoveRestriction === r.groupId) {
+                      <div>
+                        <button class="btn btn-danger btn-sm me-1" (click)="removeModelRestriction(r.groupId)" [disabled]="removingRestriction">
+                          @if (removingRestriction) { <span class="spinner-border spinner-border-sm"></span> } @else { <i class="bi bi-check-lg"></i> }
+                        </button>
+                        <button class="btn btn-outline-secondary btn-sm" (click)="cancelRemoveRestriction()" [disabled]="removingRestriction">
+                          <i class="bi bi-x-lg"></i>
+                        </button>
+                      </div>
+                    } @else {
+                      <button class="btn btn-outline-danger btn-sm" (click)="removeModelRestriction(r.groupId)" title="Remove restriction">
+                        <i class="bi bi-trash"></i>
+                      </button>
+                    }
+                  </li>
+                }
+              </ul>
+            }
+          </div>
+        </div>
+        } <!-- end loadingDetail else -->
+      } @else {
+        <div class="card border-0 shadow-sm">
+          <div class="card-body text-center py-5 text-muted">
+            <i class="bi bi-arrow-left-circle fs-1"></i>
+            <p class="mt-2">Select an API to view details.</p>
+          </div>
+        </div>
+      }
+    </div>
+  </div>
+}
+
+<!-- RBAC TAB -->
+@if (tab() === 'rbac') {
+  @if (showAssign) {
+    <div class="card border-0 shadow-sm mb-4">
+      <div class="card-body">
+        <h6><i class="bi bi-shield-plus me-1"></i> Assign Role</h6>
+        <div class="row g-3 mt-1">
+          <div class="col-md-3">
+            <label class="form-label">Principal ID</label>
+            <input class="form-control" [(ngModel)]="newRole.principalId" placeholder="Object ID (optional if APIM)" />
+          </div>
+          <div class="col-md-2">
+            <label class="form-label">Principal Type <span class="text-danger">*</span></label>
+            <select class="form-select" [(ngModel)]="newRole.principalType">
+              <option>User</option>
+              <option>Group</option>
+              <option>ServicePrincipal</option>
+            </select>
+          </div>
+          <div class="col-md-3">
+            <label class="form-label">Role Name <span class="text-danger">*</span></label>
+            <input class="form-control" [(ngModel)]="newRole.roleName" placeholder="e.g. Cognitive Services User" />
+          </div>
+          <div class="col-md-2">
+            <label class="form-label">Project Name</label>
+            <input class="form-control" [(ngModel)]="newRole.projectName" placeholder="Optional" />
+          </div>
+          <div class="col-md-2 d-flex align-items-end">
+            <div class="form-check">
+              <input class="form-check-input" type="checkbox" [(ngModel)]="newRole.useApimIdentity" id="useApim" />
+              <label class="form-check-label" for="useApim">Use APIM Identity</label>
+            </div>
+          </div>
+        </div>
+        <div class="mt-3">
+          <button class="btn btn-success me-2" (click)="assignRole()" [disabled]="assigning || !newRole.roleName || !newRole.principalType">
+            @if (assigning) { <span class="spinner-border spinner-border-sm me-1"></span> }
+            Assign
+          </button>
+          <button class="btn btn-outline-secondary" (click)="showAssign = false">Cancel</button>
+        </div>
+      </div>
+    </div>
+  }
+
+  @if (roles().length === 0) {
+    <div class="card border-0 shadow-sm">
+      <div class="card-body text-center py-5">
+        <i class="bi bi-shield-lock fs-1 text-muted"></i>
+        <p class="mt-2 text-muted">No role assignments found.</p>
+      </div>
+    </div>
+  } @else {
+    <div class="card border-0 shadow-sm">
+      <div class="table-responsive">
+        <table class="table table-hover mb-0">
+          <thead class="table-light">
+            <tr>
+              <th>Principal</th>
+              <th>Type</th>
+              <th>Role</th>
+              <th width="80"></th>
+            </tr>
+          </thead>
+          <tbody>
+            @for (r of roles(); track r.id ?? r.name) {
+              <tr>
+                <td>
+                  @if (principalNames()[r.properties?.principalId]) {
+                    <span>{{ principalNames()[r.properties?.principalId] }}</span>
+                    <br><code class="small text-muted">{{ r.properties?.principalId }}</code>
+                  } @else {
+                    <code class="small">{{ r.properties?.principalId }}</code>
+                  }
+                </td>
+                <td>
+                  @switch (r.properties?.principalType) {
+                    @case ('ServicePrincipal') { <span class="badge bg-info">Service Principal</span> }
+                    @case ('User') { <span class="badge bg-primary">User</span> }
+                    @case ('Group') { <span class="badge bg-success">Group</span> }
+                    @default { <span class="badge bg-secondary">{{ r.properties?.principalType }}</span> }
+                  }
+                </td>
+                <td>{{ getRoleName(r.properties?.roleDefinitionId ?? '') }}</td>
+                <td>
+                  <button class="btn btn-outline-danger btn-sm" (click)="deleteRole(r.name ?? r.id)" title="Remove">
+                    <i class="bi bi-trash"></i>
+                  </button>
+                </td>
+              </tr>
+            }
+          </tbody>
+        </table>
+      </div>
+    </div>
+  }
+}

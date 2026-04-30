@@ -1,0 +1,9 @@
+@use 'bootstrap/scss/bootstrap';
+@import 'bootstrap-icons/font/bootstrap-icons.css';
+
+html, body {
+  height: 100%;
+  margin: 0;
+  overflow: hidden;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+}

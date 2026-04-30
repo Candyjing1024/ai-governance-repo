@@ -1,0 +1,40 @@
+@AIGatewayManagementAPI_HostAddress = http://localhost:5099
+@apiId = foundry-api
+
+### Get APIM instance
+GET {{AIGatewayManagementAPI_HostAddress}}/api/gateway/apim
+Accept: application/json
+
+###
+
+### List APIs
+GET {{AIGatewayManagementAPI_HostAddress}}/api/gateway/apis
+Accept: application/json
+
+###
+
+### Get current policy
+GET {{AIGatewayManagementAPI_HostAddress}}/api/gateway/apis/{{apiId}}/policy
+Accept: application/json
+
+###
+
+### ===== T17: List group IDs in current policy =====
+GET {{AIGatewayManagementAPI_HostAddress}}/api/gateway/apis/{{apiId}}/policy/groups
+Accept: application/json
+
+###
+
+### ===== T17: Add group to APIM JWT policy (grant access) =====
+# Replace {groupId} with the Entra security group object ID
+PUT {{AIGatewayManagementAPI_HostAddress}}/api/gateway/apis/{{apiId}}/policy/groups/{groupId}
+Accept: application/json
+
+###
+
+### ===== T19: Remove group from APIM JWT policy (revoke access) =====
+# Replace {groupId} with the group object ID to remove
+DELETE {{AIGatewayManagementAPI_HostAddress}}/api/gateway/apis/{{apiId}}/policy/groups/{groupId}
+Accept: application/json
+
+###
